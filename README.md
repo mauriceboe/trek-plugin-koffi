@@ -25,9 +25,10 @@ sunglasses. Vacation mode.
 
 | Permission | Why this plugin needs it |
 |---|---|
-| `db:read:trips` | To read the current trip's start/end dates so Koffi knows how excited to be. The read is membership-checked by TREK, so he only ever sees a trip you already have access to. |
+| `db:read:trips` | To read the current trip's start/end dates so the troupe knows how excited to be. The read is membership-checked by TREK, so they only ever see a trip you already have access to. |
+| `db:own` | To remember which mascots you picked, in the plugin's own private store. Nothing else is kept, and one user's pick is never visible to another. |
 
-No network access, no data storage of its own — Koffi just vibes.
+No network access — the troupe just vibes.
 
 ## Setup
 

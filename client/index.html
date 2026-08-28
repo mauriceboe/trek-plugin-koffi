@@ -55,12 +55,2210 @@
 <div id="stage"></div>
 <div id="stage-fx"></div>
 
-<script src="engine.js"></script>
-<script src="characters/koffi.js"></script>
-<script src="characters/chiki.js"></script>
-<script src="characters/passi.js"></script>
-<script src="characters/puffi.js"></script>
-<script src="director.js"></script>
+<!-- build:inline-scripts:begin -->
+<!-- engine.js -->
+<script>
+// Mascot engine — the character-agnostic half of what used to be Koffi's inline
+// script. One Runtime per character on the stage (max two), each with its own
+// weighted state machine, locomotion, blink/shine micro-loops and lane. A
+// character is pure data + choreography (see characters/*.js): SVG markup, CSS,
+// mood tables and per-state enter hooks. The engine owns time, movement and the
+// class plumbing; characters own everything that makes them feel alive.
+//
+// Registration: each character file calls TrekMascots.register(def). The stage
+// (index.html) decides which of them to spawn from the user's saved picks.
+(function () {
+  'use strict';
+
+  var DEBUG = false;
+  function log() { if (DEBUG && window.console) console.log.apply(console, ['[mascots]'].concat([].slice.call(arguments))); }
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function pick(w) {
+    var sum = 0, k;
+    for (k in w) sum += w[k];
+    var r = Math.random() * sum;
+    for (k in w) { r -= w[k]; if (r <= 0) return k; }
+    return 'idle';
+  }
+
+  var reduced = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /**
+   * One live character on the stage.
+   *
+   * def = {
+   *   id, name, width, height,
+   *   svg,                    // inner stage markup (svg + fx overlays)
+   *   css,                    // stylesheet, selectors scoped under #m-<id>
+   *   stateClasses: [...],    // every class setState must sweep
+   *   config: { speed, step, dur, weights, sleepFromSit, waveEveryMs, rollBoost? },
+   *   enter: { stateName: function (k) {...}, ... },
+   *   moodFromTrip: function (days, ongoing) -> mood string,
+   *   moods: ['chill', ...],  // valid moods (class mood-<m> is applied)
+   *   reducedPose: 'pose-sit',// class(es) for the static reduced-motion pose
+   *   glide: { state, boost, outClass, spinClass } | null,  // roll-style gliding state
+   * }
+   */
+  function Runtime(def, stage, opts) {
+    this.def = def;
+    this.opts = opts || {};
+    this.el = document.createElement('div');
+    this.el.className = 'mascot';
+    this.el.id = 'm-' + def.id;
+    this.el.setAttribute('data-ch', def.id);
+    this.el.style.width = def.width + 'px';
+    this.el.style.height = def.height + 'px';
+    this.el.innerHTML =
+      (def.shadow || '') +
+      '<div class="jumper"><div class="flip">' + def.svg + '</div></div>' +
+      (def.fx || '');
+    stage.appendChild(this.el);
+    this.flip = this.el.querySelector('.flip');
+
+    this.mood = def.moods[0];
+    this.x = 0; this.dir = 1; this.vx = 0;
+    this.minX = 6; this.maxX = 100;
+    this.state = ''; this.walkTarget = null; this.afterWalk = null; this.forceNext = null;
+    this.lastWave = performance.now();
+    this.glideMoving = false; this.glideTucked = true;
+    this.timers = [];
+    this.booted = false;
+    this.paused = false;          // director holds the FSM during a duet
+    this.lastT = performance.now();
+    this.lastTurnT = -1e9;
+    this.tripDays = null; this.tripOngoing = false;
+  }
+
+  Runtime.prototype = {
+    addC: function (c) { this.el.classList.add(c); },
+    remC: function (c) { this.el.classList.remove(c); },
+    hasC: function (c) { return this.el.classList.contains(c); },
+    later: function (fn, ms) { var t = setTimeout(fn, ms); this.timers.push(t); return t; },
+    clearTimers: function () {
+      for (var i = 0; i < this.timers.length; i++) clearTimeout(this.timers[i]);
+      this.timers.length = 0;
+    },
+    rand: rand,
+
+    setLane: function (minX, maxX) {
+      this.minX = minX;
+      this.maxX = Math.max(minX, maxX);
+      this.x = clamp(this.x, this.minX, this.maxX);
+    },
+
+    setDir: function (d) {
+      if (this.booted && d !== this.dir && !reduced && this.def.onTurn) this.def.onTurn(this);
+      this.dir = d;
+      this.flip.style.transform = 'scaleX(' + (d < 0 ? -1 : 1) + ')';
+      this.el.classList.toggle('flipped', d < 0); // counter-flips text glyphs
+    },
+
+    /** re-trigger a one-shot class (reflow-cycled) */
+    pulse: function (c, ms) {
+      var self = this;
+      this.remC(c); void this.el.offsetWidth; this.addC(c);
+      if (ms) setTimeout(function () { self.remC(c); }, ms);
+    },
+
+    chooseNext: function () {
+      var def = this.def, cfg = def.config;
+      var now = performance.now();
+      if (def.afterState && def.afterState[this.state]) return def.afterState[this.state];
+      if (cfg.waveEveryMs && now - this.lastWave > cfg.waveEveryMs && this.state !== 'wave') return 'wave';
+      if (this.forceNext) { var f = this.forceNext; this.forceNext = null; return f; }
+      if (this.state === 'sit') {
+        return pick({ walk: 3, idle: 2, sleep: (cfg.sleepFromSit && cfg.sleepFromSit[this.mood]) || 0 });
+      }
+      var base = cfg.weights[this.mood], w = {}, k;
+      for (k in base) if (base[k] > 0) w[k] = base[k];
+      if (def.filterWeights) def.filterWeights(this, w);
+      if (def.glide && this.maxX - this.minX < 130) delete w[def.glide.state]; // gliding needs runway
+      if (this.state !== 'walk') delete w[this.state];  // no immediate repeats except walking
+      return pick(w);
+    },
+
+    tuckGlide: function () {
+      var g = this.def.glide;
+      if (!g || this.glideTucked) return;
+      this.glideTucked = true;
+      this.glideMoving = false;
+      this.remC(g.spinClass);
+      this.remC(g.outClass);
+      var self = this;
+      this.later(function () { if (self.def.onGlideTuck) self.def.onGlideTuck(self); }, 150);
+    },
+
+    setState: function (name) {
+      this.clearTimers();
+      this.glideMoving = false;
+      this.glideTucked = true;
+      var sc = this.def.stateClasses;
+      for (var i = 0; i < sc.length; i++) this.remC(sc[i]);
+
+      // edge states walk over first when mid-strip (peek and friends)
+      var edgeStates = this.def.edgeStates || {};
+      if (edgeStates[name]) {
+        var edge = (this.x - this.minX < this.maxX - this.x) ? this.minX : this.maxX;
+        if (Math.abs(this.x - edge) > (this.def.config.edgeSnap || 34)) {
+          this.walkTarget = edge;
+          this.afterWalk = name;
+          this.setDir(edge < this.x ? -1 : 1);
+          this.state = 'walk';
+          this.addC('st-walk');
+          var self0 = this;
+          this.later(function () { self0.end(); },
+            Math.abs(this.x - edge) / this.def.config.speed[this.mood] * 1000 + 4000); // safety net
+          return;
+        }
+      }
+
+      this.state = name;
+      this.walkTarget = null;
+      this.addC('st-' + name);
+      if (this.def.enter[name]) this.def.enter[name](this);
+      var d = this.def.config.dur[name] || [2000, 3000];
+      var self = this;
+      this.later(function () { self.end(); }, rand(d[0], d[1]));
+      log(this.def.id, 'state:', name, 'mood:', this.mood);
+    },
+
+    end: function () {
+      if (this.paused) return; // director resumes us explicitly
+      var q = this.afterWalk;
+      this.afterWalk = null;
+      this.setState(q || this.chooseNext());
+    },
+
+    /** director hooks: freeze/unfreeze the autonomous FSM */
+    hold: function () { this.paused = true; this.clearTimers(); },
+    release: function (nextState) {
+      this.paused = false;
+      this.onArrive = null;
+      this.setState(nextState || this.chooseNext());
+    },
+
+    /**
+     * Director-driven state: swap classes + run the enter hook, but never
+     * auto-advance — the scene decides when this beat is over. skipEnter lets a
+     * scene use the walk cycle without enter.walk's random direction flip.
+     */
+    play: function (name, opts) {
+      this.clearTimers();
+      var sc = this.def.stateClasses;
+      for (var i = 0; i < sc.length; i++) this.remC(sc[i]);
+      this.state = name;
+      this.walkTarget = null;
+      this.addC('st-' + name);
+      if (!(opts && opts.skipEnter) && this.def.enter[name]) this.def.enter[name](this);
+    },
+
+    /** walk to an x position; resolves via onArrive while held by the director */
+    walkTo: function (target, done) {
+      this.play('walk', { skipEnter: true });
+      this.setDir(target < this.x ? -1 : 1);
+      this.walkTarget = target;
+      this.onArrive = done;
+    },
+
+    tick: function (t) {
+      var dt = Math.min(.05, (t - this.lastT) / 1000);
+      this.lastT = t;
+      var g = this.def.glide;
+      var gliding = g && this.state === g.state && this.glideMoving;
+      var moving = this.state === 'walk' || gliding;
+      var tv = moving ? this.dir * this.def.config.speed[this.mood] * (gliding ? (g.boost || 1.5) : 1) : 0;
+      this.vx += (tv - this.vx) * Math.min(1, dt * (moving ? 4.5 : 9));
+      this.x = clamp(this.x + this.vx * dt, this.minX, this.maxX);
+      if (this.state === 'walk') {
+        if (this.walkTarget == null) {
+          if (!this.paused) {
+            // Early-turn only when the strip is wide enough for two pads, and never
+            // twice within 500ms — a tiny lane otherwise flip-thrashes every frame.
+            var tp = this.def.config.turnPad == null ? 20 : this.def.config.turnPad;
+            var pad = this.maxX - this.minX > tp * 2 + 8 ? tp : 0;
+            if (t - this.lastTurnT > 500) {
+              if (this.dir < 0 && this.x <= this.minX + pad) { this.lastTurnT = t; this.setDir(1); }
+              else if (this.dir > 0 && this.x >= this.maxX - pad) { this.lastTurnT = t; this.setDir(-1); }
+            }
+          }
+        } else if (Math.abs(this.x - this.walkTarget) < 3 || this.x <= this.minX || this.x >= this.maxX) {
+          this.walkTarget = null;
+          if (this.paused && this.onArrive) {
+            var cb = this.onArrive;
+            this.onArrive = null;
+            cb(this);
+          } else {
+            this.end();
+          }
+        }
+      } else if (gliding) {
+        if ((this.dir < 0 && this.x <= this.minX + 4) || (this.dir > 0 && this.x >= this.maxX - 4)) this.tuckGlide();
+      }
+      this.el.style.transform = 'translate3d(' + this.x.toFixed(2) + 'px,0,0)';
+    },
+
+    setMood: function (m) {
+      var def = this.def;
+      if (def.moods.indexOf(m) < 0) m = def.moods[0];
+      var changed = m !== this.mood;
+      this.mood = m;
+      for (var i = 0; i < def.moods.length; i++) this.remC('mood-' + def.moods[i]);
+      this.addC('mood-' + m);
+      this.el.style.setProperty('--step', def.config.step[m]);
+      if (def.onMood) def.onMood(this, m, changed);
+      log(def.id, 'mood:', m);
+    },
+
+    applyTrip: function (days, ongoing) {
+      this.tripDays = days;
+      this.tripOngoing = ongoing;
+      this.setMood(this.def.moodFromTrip(days, ongoing));
+    },
+
+    boot: function (laneMin, laneMax) {
+      this.setLane(laneMin, laneMax);
+      this.x = clamp(this.minX + (this.maxX - this.minX) * rand(.3, .7), this.minX, this.maxX);
+      this.setDir(Math.random() < .5 ? -1 : 1);
+      this.setMood(this.def.moods[0]);
+      this.el.style.transform = 'translate3d(' + this.x.toFixed(2) + 'px,0,0)';
+      this.booted = true;
+      if (reduced) {
+        var poses = (this.def.reducedPose || '').split(' ');
+        for (var i = 0; i < poses.length; i++) if (poses[i]) this.addC(poses[i]);
+        return;
+      }
+      // Blinking + specular shine live outside the FSM so they never stall.
+      var self = this;
+      (function blinkLoop() {
+        setTimeout(function () {
+          if (self.dead) return;
+          if (self.state !== 'sleep' && !self.hasC('squint')) {
+            self.pulse('blink', self.def.blinkMs || 130);
+            if (Math.random() < .3) setTimeout(function () { self.pulse('blink', self.def.blinkMs || 130); }, 250);
+          }
+          blinkLoop();
+        }, rand.apply(null, self.def.blinkEvery || [2300, 5600]));
+      })();
+      if (this.def.shineClasses && this.def.shineClasses.length) {
+        (function shineLoop() {
+          setTimeout(function () {
+            if (self.dead) return;
+            if (self.state !== 'sleep') {
+              var cs = self.def.shineClasses;
+              var c = cs[Math.floor(Math.random() * cs.length)];
+              self.addC(c);
+              setTimeout(function () { self.remC(c); }, 1100);
+            }
+            shineLoop();
+          }, rand(9000, 22000));
+        })();
+      }
+      if (this.def.ambient) this.def.ambient(this); // character-owned always-on loops
+      this.setState('idle');
+    },
+
+    destroy: function () {
+      this.dead = true;
+      this.clearTimers();
+      if (this.el.parentNode) this.el.parentNode.removeChild(this.el);
+    }
+  };
+
+  var registry = {};
+  var order = [];
+
+  window.TrekMascots = {
+    reduced: reduced,
+    rand: rand,
+    clamp: clamp,
+    pick: pick,
+    register: function (def) {
+      if (!registry[def.id]) order.push(def.id);
+      registry[def.id] = def;
+      if (def.css) {
+        var s = document.createElement('style');
+        s.setAttribute('data-ch', def.id);
+        s.textContent = def.css;
+        document.head.appendChild(s);
+      }
+    },
+    get: function (id) { return registry[id]; },
+    ids: function () { return order.slice(); },
+    Runtime: Runtime
+  };
+})();
+</script>
+<!-- characters/koffi.js -->
+<script>
+// Koffi -- the original: a tiny vintage suitcase with travel stickers, a
+// swinging luggage tag and big friendly eyes. Ported unchanged onto the
+// shared mascot engine; every state, weight and timing matches 1.0.
+(function () {
+  'use strict';
+
+  var CSS = "\n\n  /* ---- moving root: JS drives translate3d(x) ---- */\n\n#m-koffi .jumper, #m-koffi .flip { position: absolute; inset: 0; }\n#m-koffi .jumper { transform-origin: 50% 100%; }\n#m-koffi .flip { transition: transform .26s ease; transform-origin: 50% 50%; }\n\n#m-koffi .char {\n    display: block;\n    position: absolute;\n    left: 0;\n    bottom: 0;\n    overflow: visible;\n    /* rim: dark shadow + faint light halo so Koffi reads on any hero image */\n    filter: drop-shadow(0 1px 1px rgba(2,6,23,.35)) drop-shadow(0 0 1px rgba(248,250,252,.3));\n  }\n\n  /* ---- ground shadow ---- */\n#m-koffi .shadow {\n    position: absolute;\n    left: 50%;\n    bottom: 0;\n    margin-left: -33px;\n    opacity: .17;\n    filter: blur(1.1px);\n    transform-origin: 50% 100%;\n    transition: transform .4s ease, opacity .4s ease;\n  }\n#m-koffi.pose-sit #m-koffi .shadow { transform: scaleX(1.12); opacity: .21; }\n#m-koffi.roll-out #m-koffi .shadow { transform: scaleX(1.3); opacity: .2; }\n\n  /* ---- SVG group plumbing: CSS transforms in viewBox units ---- */\n  #kf-root, #kf-trunk, #kf-breathe, #kf-face, #kf-legL, #kf-legR, #kf-lid, #kf-tag, #kf-pupils, #kf-lids, #kf-armF, #kf-armB, #kf-map, #kf-postcard, #kf-tele, #kf-tagCard, #kf-stamp, #kf-stampAnim, #kf-puffS, #kf-squint { transform-box: view-box; }\n\n#kf-root { transform-origin: 32px 70px; transition: transform .55s cubic-bezier(.4,0,.3,1); }\n#kf-trunk { transform-origin: 32px 60px; transition: transform .48s cubic-bezier(.34,1.4,.64,1); }\n#kf-breathe { transform-origin: 32px 58px; animation: kfBreathe 3.4s ease-in-out infinite; }\n#kf-legL { transform-origin: 25px 53px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n#kf-legR { transform-origin: 39px 53px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n#kf-lid { transform-origin: 9px 29px;  transition: transform .35s cubic-bezier(.34,1.5,.64,1); }\n#kf-tag { transform-origin: 37.5px 16px; animation: kfTagIdle 3.8s ease-in-out infinite; }\n#kf-armF { transform-origin: 54.3px 38px; transform: rotate(-8deg); transition: transform .3s ease; }\n#kf-armB { transform-origin: 10.5px 38px; transform: rotate(8deg);  transition: transform .3s ease; }\n#kf-lids { transform-origin: 32px 35.4px; transform: scaleY(0); transition: transform .09s ease-out; }\n#kf-pupils { transition: transform .3s ease, opacity .12s ease; animation: kfDrift 9s ease-in-out infinite; }\n#kf-map { transform-origin: 36px 55px; transform: scale(.2,.06); opacity: 0;\n            transition: transform .55s cubic-bezier(.3,1.4,.4,1), opacity .2s ease; }\n#kf-postcard { transition: transform .5s cubic-bezier(.25,1.35,.4,1) .12s; }\n#kf-shades { transform: translateY(-15px); opacity: 0;\n            transition: transform .65s cubic-bezier(.34,1.56,.64,1) .1s, opacity .3s ease .1s; }\n#kf-flag { opacity: 0; transition: opacity .25s ease .25s; }\n\n  /* trolley kit: telescope handle + pop-out wheels, tucked by default */\n#kf-tele { transform-origin: 13px 20.5px; transform: scaleY(0);\n            transition: transform .16s cubic-bezier(.55,-.35,.65,1.2); }\n#m-koffi .wheel { transform: scale(0); transition: transform .18s cubic-bezier(.55,-.35,.65,1.2); }\n\n  /* split-flap tag card + unmirrored number */\n#kf-tagCard { transform-origin: 40.6px 26.3px; }\n#kf-tagNum { opacity: 0; transform-box: fill-box; transform-origin: center; transition: opacity .18s ease; }\n#kf-tagLines { transition: opacity .18s ease; }\n#m-koffi.flipped #kf-tagNum { transform: scaleX(-1); } /* counter-flip: glyphs never mirror */\n#m-koffi.tag-num #kf-tagNum { opacity: 1; }\n#m-koffi.tag-num #kf-tagLines { opacity: 0; }\n\n  /* stamp rig sits above Koffi, slides along --sx/--sy to the target sticker slot */\n#kf-stampAnim { opacity: 0; transform-origin: 32px 45.5px; }\n#kf-stamp, #kf-puffS { transform: translate(var(--sx, 0px), var(--sy, 0px)); }\n\n  /* stamped stickers: hidden until earned, then persist for the session */\n#m-koffi .stk { opacity: 0; transform: scale(.2);\n         transition: transform .5s cubic-bezier(.3,1.5,.5,1), opacity .25s ease; }\n#m-koffi.stk-on-1 #kf-stk1, #m-koffi.stk-on-2 #kf-stk2, #m-koffi.stk-on-3 #kf-stk3, #m-koffi.stk-on-4 #kf-stk4 { opacity: .95; transform: scale(1); }\n#m-koffi.stk-b1 #kf-stk1, #m-koffi.stk-b2 #kf-stk2, #m-koffi.stk-b3 #kf-stk3, #m-koffi.stk-b4 #kf-stk4 { animation: kfStkPop .6s ease-in-out; }\n\n#kf-squint { opacity: 0; transition: opacity .12s ease; }\n#m-koffi .conf, #m-koffi .streak, #m-koffi .pg, #m-koffi .ps { opacity: 0; }\n#m-koffi .conf, #m-koffi .stk, #m-koffi .wheel, #m-koffi .wspin, #m-koffi .pg, #m-koffi .ps { transform-box: fill-box; transform-origin: center; }\n#m-koffi .streak { transform-box: view-box; }\n\n  /* ---- eyes ---- */\n#m-koffi.blink #kf-lids, #m-koffi.st-sleep #kf-lids, #m-koffi.eyes-closed #kf-lids { transform: scaleY(1); }\n#m-koffi.look-down #kf-pupils { animation: none; transform: translate(.9px, 2.1px); }\n#m-koffi.look-up   #kf-pupils { animation: none; transform: translate(.6px, -2.2px); }\n#m-koffi.look-l    #kf-pupils { animation: none; transform: translate(-1.5px, .2px); }\n#m-koffi.look-r    #kf-pupils { animation: none; transform: translate(1.5px, .2px); }\n#m-koffi.squint #kf-pupils { opacity: 0; }\n#m-koffi.squint #kf-squint { opacity: 1; }\n\n  /* ---- tag twitch (idle micro-motion) ---- */\n#m-koffi.twitch #kf-tag { animation: kfTagTwitch .55s ease-in-out; }\n\n  /* ---- walk cycle ---- */\n#m-koffi.st-walk #kf-legL { animation: kfStep var(--step) ease-in-out infinite; }\n#m-koffi.st-walk #kf-legR { animation: kfStep var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -2); }\n#m-koffi.st-walk #kf-trunk { animation: kfBob calc(var(--step) / 2) ease-in-out infinite; }\n#m-koffi.st-walk #kf-face { animation: kfCounter calc(var(--step) / 2) ease-in-out infinite; animation-delay: calc(var(--step) / -10); }\n#m-koffi.st-walk #kf-tag { animation: kfTagWalk var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -7); }\n#m-koffi.st-walk #kf-lid { animation: kfLidJig calc(var(--step) / 2) ease-in-out infinite; animation-delay: calc(var(--step) / -14); }\n#m-koffi.st-walk #kf-armF { animation: kfArmF var(--step) ease-in-out infinite; }\n#m-koffi.st-walk #kf-armB { animation: kfArmB var(--step) ease-in-out infinite; }\n\n  /* tag flutter on turn-around (after walk rules so it wins for its .6s) */\n#m-koffi.flutter #kf-tag { animation: kfTagFlutter .6s ease-in-out; }\n\n  /* ---- sit / sleep pose ---- */\n#m-koffi.pose-sit #kf-trunk { transform: translateY(11px); }\n#m-koffi.pose-sit #kf-legL { transform: translate(18px, 11px) rotate(86deg); }\n#m-koffi.pose-sit #kf-legR { transform: translate(15px, 11px) rotate(74deg); }\n#m-koffi.st-sleep #kf-trunk { transform: translateY(11px) rotate(-4deg); }\n#m-koffi.st-sleep #kf-breathe { animation-name: kfBreatheDeep; animation-duration: 4.6s; }\n\n  /* ---- sleep z's (outside the flip wrapper: glyphs never mirror) ---- */\n#m-koffi .fx { position: absolute; inset: 0; pointer-events: none; }\n#m-koffi .zz {\n    position: absolute; top: 6px; opacity: 0;\n    font: italic 700 13px/1 \"Trebuchet MS\", \"Segoe UI\", sans-serif;\n    color: #EEF2FF;\n    text-shadow: 0 1px 2px rgba(30,27,75,.75);\n  }\n#m-koffi .z1 { left: 38px; } .z2 { left: 29px; } .z3 { left: 46px; }\n#m-koffi.st-sleep .z1 { animation: kfZ 2.7s ease-in-out infinite; }\n#m-koffi.st-sleep .z2 { animation: kfZ 2.7s ease-in-out .9s infinite; }\n#m-koffi.st-sleep .z3 { animation: kfZ 2.7s ease-in-out 1.8s infinite; }\n\n  /* ---- state one-shots ---- */\n#m-koffi.st-wave #kf-armF { animation: kfWave 1.9s ease-in-out; }\n#m-koffi.mood-hype.st-wave #kf-flag { opacity: 1; }\n\n#m-koffi.st-jump #m-koffi .jumper { animation: kfJump .95s cubic-bezier(.4,0,.4,1); }\n#m-koffi.st-jump #m-koffi .shadow { animation: kfShadowJump .95s cubic-bezier(.4,0,.4,1); }\n#m-koffi.lid-crack #kf-lid { transform: rotate(-8deg); }\n\n#m-koffi.st-spin #m-koffi .jumper { animation: kfSpin .9s cubic-bezier(.45,.05,.55,.95); }\n#m-koffi.st-spin #m-koffi .shadow { animation: kfShadowSpin .9s ease-in-out; }\n\n#m-koffi.hop #m-koffi .jumper { animation: kfHop .45s ease-in-out; }\n#m-koffi.hop #m-koffi .shadow { animation: kfShadowHop .45s ease-in-out; }\n\n#m-koffi.st-peek #kf-root { transform: rotate(9deg) translateX(1.5px); }\n\n#m-koffi.st-stretch #kf-root { animation: kfStretch 1.7s ease-in-out; }\n#m-koffi.st-stretch #kf-armF { animation: kfArmStretchF 1.7s ease-in-out; }\n#m-koffi.st-stretch #kf-armB { animation: kfArmStretchB 1.7s ease-in-out; }\n\n#m-koffi.map-open #kf-map { transform: scale(1); opacity: 1; }\n#m-koffi.lid-open #kf-lid { transform: rotate(-17deg); }\n#m-koffi.lid-open #kf-postcard { transform: translateY(-13px); }\n#m-koffi.shades-on #kf-shades { transform: translateY(0); opacity: 1; }\n\n#m-koffi.burst .conf { animation: kfConf .8s ease-out forwards; }\n#m-koffi.burst .conf:nth-child(2n) { animation-duration: .95s; }\n\n  /* ---- trolley roll ---- */\n#m-koffi.roll-out #kf-root { transform: rotate(-17deg); }\n#m-koffi.roll-out #kf-legL { transform: translate(2px, -9px) rotate(55deg); }\n#m-koffi.roll-out #kf-legR { transform: translate(0, -4px) rotate(46deg); }\n#m-koffi.roll-out #kf-tele { transform: scaleY(1); transition: transform .38s cubic-bezier(.34,1.45,.64,1) .06s; }\n#m-koffi.roll-out .wheel { transform: scale(1); transition: transform .3s cubic-bezier(.34,1.6,.64,1); }\n#m-koffi.rolling .wspin { animation: kfWheelSpin .45s linear infinite; }\n\n  /* ---- passport stamp ---- */\n#m-koffi.stamping #kf-stampAnim { animation: kfStamp 2.5s ease-in-out; }\n#m-koffi.stamp-hit #kf-trunk { animation: kfStampHit .5s ease-out; }\n\n  /* ---- split-flap tag ---- */\n#m-koffi.flapping #kf-tagCard { animation: kfFlap .82s ease-in-out; }\n\n  /* ---- specular shine sweeps ---- */\n#m-koffi.sh1 #kf-shineStk { animation: kfShine .95s ease-in-out; }\n#m-koffi.sh2 #kf-shineBkL, #m-koffi.sh3 #kf-shineBkR { animation: kfShine .8s ease-in-out; }\n\n  /* ---- dust puffs ---- */\n#m-koffi.puffG .pg { animation: kfPuff .6s ease-out; }\n#m-koffi.puffS .ps { animation: kfPuff .55s ease-out; }\n\n  /* ---- keyframes ---- */\n  @keyframes kfStep    { 0%,100% { transform: rotate(20deg); } 50% { transform: rotate(-20deg); } }\n  @keyframes kfBob     { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-1.7px); } }\n  @keyframes kfCounter { 0%,100% { transform: translateY(0); } 50% { transform: translateY(1px); } }\n  @keyframes kfTagWalk { 0%,100% { transform: rotate(11deg); } 50% { transform: rotate(-13deg); } }\n  @keyframes kfTagIdle { 0%,100% { transform: rotate(-2.5deg); } 50% { transform: rotate(3deg); } }\n  @keyframes kfTagTwitch { 0%,100% { transform: rotate(0); } 25% { transform: rotate(10deg); } 55% { transform: rotate(-7deg); } 80% { transform: rotate(4deg); } }\n  @keyframes kfTagFlutter { 0%,100% { transform: rotate(0); } 20% { transform: rotate(14deg); } 45% { transform: rotate(-11deg); } 70% { transform: rotate(7deg); } 88% { transform: rotate(-3deg); } }\n  @keyframes kfLidJig  { 0%,100% { transform: rotate(0); } 50% { transform: rotate(-1.2deg); } }\n  @keyframes kfArmF    { 0%,100% { transform: rotate(-16deg); } 50% { transform: rotate(4deg); } }\n  @keyframes kfArmB    { 0%,100% { transform: rotate(14deg); } 50% { transform: rotate(-4deg); } }\n  @keyframes kfBreathe     { 0%,100% { transform: scale(1); } 50% { transform: scale(1.008, 1.022); } }\n  @keyframes kfBreatheDeep { 0%,100% { transform: scale(1); } 50% { transform: scale(1.015, 1.04); } }\n  @keyframes kfDrift {\n    0%,100% { transform: translate(0,0); }\n    22%     { transform: translate(.8px,.3px); }\n    48%     { transform: translate(-.7px,.5px); }\n    72%     { transform: translate(.3px,-.3px); }\n  }\n  @keyframes kfZ {\n    0%   { opacity: 0; transform: translate(0, 6px) scale(.6); }\n    25%  { opacity: .9; }\n    100% { opacity: 0; transform: translate(11px, -26px) scale(1.35); }\n  }\n  @keyframes kfJump {\n    0%   { transform: translateY(0)     scale(1); }\n    16%  { transform: translateY(0)     scale(1.1, .84); }   /* anticipation squash */\n    28%  { transform: translateY(-10px) scale(.95, 1.08); }  /* launch stretch */\n    50%  { transform: translateY(-30px) scale(1, 1.02); }\n    72%  { transform: translateY(-2px)  scale(.98, 1.02); }\n    82%  { transform: translateY(0)     scale(1.12, .84); }  /* landing squash */\n    92%  { transform: translateY(0)     scale(.97, 1.03); }\n    100% { transform: translateY(0)     scale(1); }\n  }\n  @keyframes kfShadowJump {\n    0%   { transform: scale(1); opacity: .17; }\n    16%  { transform: scale(1.08, 1); opacity: .2; }\n    50%  { transform: scale(.55); opacity: .06; }\n    82%  { transform: scale(1.14, 1); opacity: .22; }\n    100% { transform: scale(1); opacity: .17; }\n  }\n  @keyframes kfSpin {\n    0%   { transform: rotateY(0)      translateY(0); }\n    45%  { transform: rotateY(180deg) translateY(-8px); }\n    100% { transform: rotateY(360deg) translateY(0); }\n  }\n  @keyframes kfShadowSpin { 0%,100% { transform: scale(1); opacity: .17; } 45% { transform: scale(.8); opacity: .11; } }\n  @keyframes kfHop {\n    0%   { transform: translateY(0)    scale(1); }\n    25%  { transform: translateY(0)    scale(1.06, .9); }\n    55%  { transform: translateY(-8px) scale(.98, 1.04); }\n    85%  { transform: translateY(0)    scale(1.05, .94); }\n    100% { transform: translateY(0)    scale(1); }\n  }\n  @keyframes kfShadowHop { 0%,100% { transform: scale(1); opacity: .17; } 55% { transform: scale(.85); opacity: .12; } }\n  @keyframes kfWave {\n    0%   { transform: rotate(-8deg); }\n    18%  { transform: rotate(-152deg); }\n    32%  { transform: rotate(-132deg); }\n    46%  { transform: rotate(-158deg); }\n    60%  { transform: rotate(-132deg); }\n    74%  { transform: rotate(-155deg); }\n    100% { transform: rotate(-8deg); }\n  }\n  @keyframes kfStretch {\n    0%   { transform: scale(1); }\n    30%  { transform: scale(.965, 1.06); }\n    62%  { transform: scale(.965, 1.065); }\n    82%  { transform: scale(1.035, .955); }\n    100% { transform: scale(1); }\n  }\n  @keyframes kfArmStretchF { 0%,100% { transform: rotate(-8deg); } 30%,65% { transform: rotate(-168deg); } }\n  @keyframes kfArmStretchB { 0%,100% { transform: rotate(8deg); }  30%,65% { transform: rotate(168deg); } }\n  @keyframes kfConf {\n    0%   { opacity: 0; transform: translate(0,0) scale(.4) rotate(0); }\n    12%  { opacity: 1; }\n    100% { opacity: 0; transform: translate(var(--cx), var(--cy)) scale(1.1) rotate(var(--cr)); }\n  }\n  @keyframes kfWheelSpin { to { transform: rotate(360deg); } }\n  @keyframes kfStamp {\n    0%   { transform: translate(0,-44px) scale(1); opacity: 0; }\n    9%   { transform: translate(0,-24px) scale(1); opacity: 1; }\n    26%  { transform: translate(0,-28px) scale(1); }          /* anticipation rise */\n    36%  { transform: translate(0,1px)   scale(1.05,.88); }   /* slam + squash */\n    44%  { transform: translate(0,0)     scale(1); }\n    58%  { transform: translate(0,0)     scale(1); }          /* press-and-hold */\n    68%  { transform: translate(0,-10px) scale(1); }\n    82%  { transform: translate(0,-42px) scale(1); opacity: .9; }\n    100% { transform: translate(0,-46px) scale(1); opacity: 0; }\n  }\n  @keyframes kfStampHit { 0% { transform: scale(1); } 30% { transform: scale(1.08,.9); } 60% { transform: scale(.97,1.05); } 100% { transform: scale(1); } }\n  @keyframes kfStkPop { 0%,100% { transform: scale(1); } 35% { transform: scale(1.4); } 65% { transform: scale(.88); } }\n  @keyframes kfFlap {\n    0%,25%,50%,75%,100%        { transform: scaleY(1); }\n    12.5%,37.5%,62.5%,87.5%    { transform: scaleY(.08); }\n  }\n  @keyframes kfShine {\n    0%   { opacity: 0; transform: translateX(-7px); }\n    20%  { opacity: .85; }\n    100% { opacity: 0; transform: translateX(11px); }\n  }\n  @keyframes kfPuff {\n    0%   { opacity: 0; transform: translate(0,0) scale(.4); }\n    18%  { opacity: .55; }\n    100% { opacity: 0; transform: translate(var(--px), var(--py)) scale(1.25); }\n  }\n\n  /* ---- reduced motion: single static sitting pose ---- */\n";
+
+  var SVG = "<svg class=\"char\" id=\"kf-koffi\" width=\"72\" height=\"78.75\" viewBox=\"0 0 64 70\" aria-hidden=\"true\" xmlns=\"http://www.w3.org/2000/svg\">\n        <title>Koffi the travel suitcase</title>\n        <defs>\n          <clipPath id=\"kf-cpTop\"><rect x=\"0\" y=\"0\" width=\"64\" height=\"30\"/></clipPath>\n          <clipPath id=\"kf-cpStk\"><rect x=\"25\" y=\"20.5\" width=\"8.5\" height=\"5.5\" rx=\"1.4\" transform=\"rotate(-7 29 23)\"/></clipPath>\n          <clipPath id=\"kf-cpBkL\"><rect x=\"15.9\" y=\"33\" width=\"6.2\" height=\"3.4\" rx=\".8\"/></clipPath>\n          <clipPath id=\"kf-cpBkR\"><rect x=\"41.9\" y=\"33\" width=\"6.2\" height=\"3.4\" rx=\".8\"/></clipPath>\n        </defs>\n        <g id=\"kf-root\">\n          <!-- stubby legs -->\n          <g id=\"kf-legL\">\n            <rect x=\"21.5\" y=\"52\" width=\"7\" height=\"14\" rx=\"3.5\" fill=\"#3730A3\" stroke=\"#1E1B4B\" stroke-width=\".8\"/>\n            <ellipse cx=\"26.5\" cy=\"67.6\" rx=\"5\" ry=\"2.4\" fill=\"#312E81\" stroke=\"#1E1B4B\" stroke-width=\".8\"/>\n          </g>\n          <g id=\"kf-legR\">\n            <rect x=\"35.5\" y=\"52\" width=\"7\" height=\"14\" rx=\"3.5\" fill=\"#3730A3\" stroke=\"#1E1B4B\" stroke-width=\".8\"/>\n            <ellipse cx=\"40.5\" cy=\"67.6\" rx=\"5\" ry=\"2.4\" fill=\"#312E81\" stroke=\"#1E1B4B\" stroke-width=\".8\"/>\n          </g>\n\n          <!-- trolley wheels: pop out for the roll, tucked otherwise -->\n          <g id=\"kf-wheels\">\n            <g class=\"wheel\"><g class=\"wspin\">\n              <circle cx=\"17.5\" cy=\"62.5\" r=\"3\" fill=\"#1E1B4B\" stroke=\"#0F172A\" stroke-width=\".6\"/>\n              <line x1=\"17.5\" y1=\"60.2\" x2=\"17.5\" y2=\"64.8\" stroke=\"#475569\" stroke-width=\".7\"/>\n              <line x1=\"15.2\" y1=\"62.5\" x2=\"19.8\" y2=\"62.5\" stroke=\"#475569\" stroke-width=\".7\"/>\n              <circle cx=\"17.5\" cy=\"62.5\" r=\"1\" fill=\"#64748B\"/>\n            </g></g>\n            <g class=\"wheel\"><g class=\"wspin\">\n              <circle cx=\"46.5\" cy=\"62.5\" r=\"3\" fill=\"#1E1B4B\" stroke=\"#0F172A\" stroke-width=\".6\"/>\n              <line x1=\"46.5\" y1=\"60.2\" x2=\"46.5\" y2=\"64.8\" stroke=\"#475569\" stroke-width=\".7\"/>\n              <line x1=\"44.2\" y1=\"62.5\" x2=\"48.8\" y2=\"62.5\" stroke=\"#475569\" stroke-width=\".7\"/>\n              <circle cx=\"46.5\" cy=\"62.5\" r=\"1\" fill=\"#64748B\"/>\n            </g></g>\n          </g>\n\n          <g id=\"kf-trunk\">\n            <g id=\"kf-breathe\">\n              <!-- telescope handle (behind everything, extends up-and-back) -->\n              <g id=\"kf-tele\">\n                <rect x=\"10.6\" y=\"4.8\" width=\"1.7\" height=\"16\" fill=\"#334155\" stroke=\"#1E1B4B\" stroke-width=\".6\"/>\n                <rect x=\"14.2\" y=\"4.8\" width=\"1.7\" height=\"16\" fill=\"#334155\" stroke=\"#1E1B4B\" stroke-width=\".6\"/>\n                <rect x=\"9.4\" y=\"3.2\" width=\"7.6\" height=\"3\" rx=\"1.5\" fill=\"#4338CA\" stroke=\"#1E1B4B\" stroke-width=\".8\"/>\n              </g>\n\n              <!-- back arm (painted behind the case) -->\n              <g id=\"kf-armB\">\n                <rect x=\"8\" y=\"36\" width=\"5\" height=\"12\" rx=\"2.5\" fill=\"#4338CA\" stroke=\"#312E81\" stroke-width=\"1\"/>\n              </g>\n\n              <!-- case lower body -->\n              <path d=\"M8,30 L56,30 L56,50 Q56,58 48,58 L16,58 Q8,58 8,50 Z\"\n                    fill=\"#4F46E5\" stroke=\"#312E81\" stroke-width=\"1.5\" stroke-linejoin=\"round\"/>\n              <rect x=\"11.5\" y=\"33\" width=\"41\" height=\"21.5\" rx=\"5\" fill=\"#6366F1\" opacity=\".28\"/>\n\n              <!-- leather straps + buckles (body part) -->\n              <rect x=\"16.5\" y=\"29.5\" width=\"5\" height=\"28.3\" fill=\"#B45309\" stroke=\"#7C2D12\" stroke-width=\".8\"/>\n              <rect x=\"42.5\" y=\"29.5\" width=\"5\" height=\"28.3\" fill=\"#B45309\" stroke=\"#7C2D12\" stroke-width=\".8\"/>\n              <rect x=\"15.9\" y=\"33\" width=\"6.2\" height=\"3.4\" rx=\".8\" fill=\"#FCD34D\" stroke=\"#B45309\" stroke-width=\".8\"/>\n              <rect x=\"41.9\" y=\"33\" width=\"6.2\" height=\"3.4\" rx=\".8\" fill=\"#FCD34D\" stroke=\"#B45309\" stroke-width=\".8\"/>\n\n              <!-- buckle shine sweeps -->\n              <g clip-path=\"url(#kf-cpBkL)\"><g id=\"kf-shineBkL\" class=\"streak\">\n                <rect x=\"17.8\" y=\"30.5\" width=\"1.6\" height=\"8\" fill=\"#FFFFFF\" transform=\"rotate(24 18.6 34.5)\"/>\n              </g></g>\n              <g clip-path=\"url(#kf-cpBkR)\"><g id=\"kf-shineBkR\" class=\"streak\">\n                <rect x=\"43.8\" y=\"30.5\" width=\"1.6\" height=\"8\" fill=\"#FFFFFF\" transform=\"rotate(24 44.6 34.5)\"/>\n              </g></g>\n\n              <!-- pastel travel stickers -->\n              <circle cx=\"12.8\" cy=\"45\" r=\"3.4\" fill=\"#F9A8D4\" stroke=\"#DB2777\" stroke-width=\".6\" opacity=\".95\"/>\n              <circle cx=\"51\" cy=\"50.5\" r=\"3.2\" fill=\"#FCD34D\" stroke=\"#D97706\" stroke-width=\".6\" opacity=\".95\"/>\n              <rect x=\"31\" y=\"51\" width=\"6.4\" height=\"4.6\" rx=\"1\" fill=\"#FDA4AF\" stroke=\"#E11D48\" stroke-width=\".6\"\n                    opacity=\".95\" transform=\"rotate(5 34 53)\"/>\n\n              <!-- stamped stickers: earned via passportStamp, persist for the session -->\n              <g id=\"kf-stk1\" class=\"stk\"><g transform=\"rotate(-8 26.5 51.2)\">\n                <circle cx=\"26.5\" cy=\"51.2\" r=\"2.7\" fill=\"#93C5FD\" stroke=\"#2563EB\" stroke-width=\".6\"/>\n                <path d=\"M24.9,51.9 L28.2,50.4 M26.4,50.2 L27,52.4\" fill=\"none\" stroke=\"#1D4ED8\" stroke-width=\".7\" stroke-linecap=\"round\"/>\n              </g></g>\n              <g id=\"kf-stk2\" class=\"stk\"><g transform=\"rotate(7 44.9 43.5)\">\n                <rect x=\"42.4\" y=\"41.2\" width=\"5\" height=\"4.6\" rx=\"1\" fill=\"#6EE7B7\" stroke=\"#059669\" stroke-width=\".6\"/>\n                <path d=\"M43.4,44.9 L44.5,42.6 L45.4,44.1 L46.1,43.2\" fill=\"none\" stroke=\"#047857\" stroke-width=\".7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n              </g></g>\n              <g id=\"kf-stk3\" class=\"stk\"><g transform=\"rotate(-10 13.2 52.5)\">\n                <path d=\"M13.2,49.9 L14,51.6 L15.8,51.8 L14.5,53 L14.8,54.8 L13.2,53.9 L11.6,54.8 L11.9,53 L10.6,51.8 L12.4,51.6 Z\"\n                      fill=\"#C4B5FD\" stroke=\"#7C3AED\" stroke-width=\".5\" stroke-linejoin=\"round\"/>\n              </g></g>\n              <g id=\"kf-stk4\" class=\"stk\"><g transform=\"rotate(9 48.6 42.3)\">\n                <circle cx=\"48.6\" cy=\"42.3\" r=\"2.3\" fill=\"#FDBA74\" stroke=\"#EA580C\" stroke-width=\".6\"/>\n                <circle cx=\"48.6\" cy=\"42.3\" r=\"1\" fill=\"#FED7AA\"/>\n                <path d=\"M48.6,39.3 L48.6,38.6 M48.6,45.3 L48.6,46 M45.6,42.3 L44.9,42.3 M51.6,42.3 L52.3,42.3\"\n                      stroke=\"#EA580C\" stroke-width=\".6\" stroke-linecap=\"round\"/>\n              </g></g>\n\n              <!-- postcard hiding inside the case (clipped above the lid seam) -->\n              <g clip-path=\"url(#kf-cpTop)\">\n                <g id=\"kf-postcard\">\n                  <g transform=\"rotate(-6 46 39)\">\n                    <rect x=\"41\" y=\"32\" width=\"10.5\" height=\"14\" rx=\"1\" fill=\"#FFF7ED\" stroke=\"#C2410C\" stroke-width=\"1\"/>\n                    <rect x=\"41.6\" y=\"32.6\" width=\"9.3\" height=\"2.6\" fill=\"#FDA4AF\"/>\n                    <rect x=\"47.8\" y=\"36.4\" width=\"2.6\" height=\"2.6\" fill=\"#93C5FD\" stroke=\"#3B82F6\" stroke-width=\".5\"/>\n                    <line x1=\"42.4\" y1=\"41\" x2=\"47\" y2=\"41\" stroke=\"#FDBA74\" stroke-width=\".9\" stroke-linecap=\"round\"/>\n                    <line x1=\"42.4\" y1=\"43\" x2=\"45.6\" y2=\"43\" stroke=\"#FDBA74\" stroke-width=\".9\" stroke-linecap=\"round\"/>\n                  </g>\n                </g>\n              </g>\n\n              <!-- lid (hinged at the back top corner) -->\n              <g id=\"kf-lid\">\n                <path d=\"M8,30 L8,26 A8,8 0 0 1 16,18 L48,18 A8,8 0 0 1 56,26 L56,30 Z\"\n                      fill=\"#4F46E5\" stroke=\"#312E81\" stroke-width=\"1.5\" stroke-linejoin=\"round\"/>\n                <rect x=\"16.5\" y=\"17.8\" width=\"5\" height=\"12.4\" fill=\"#B45309\" stroke=\"#7C2D12\" stroke-width=\".8\"/>\n                <rect x=\"42.5\" y=\"17.8\" width=\"5\" height=\"12.4\" fill=\"#B45309\" stroke=\"#7C2D12\" stroke-width=\".8\"/>\n                <rect x=\"25\" y=\"20.5\" width=\"8.5\" height=\"5.5\" rx=\"1.4\" fill=\"#6EE7B7\" stroke=\"#059669\" stroke-width=\".6\"\n                      opacity=\".95\" transform=\"rotate(-7 29 23)\"/>\n                <!-- sticker shine sweep (clipped to the mint sticker, rides the lid) -->\n                <g clip-path=\"url(#kf-cpStk)\"><g id=\"kf-shineStk\" class=\"streak\">\n                  <rect x=\"26.5\" y=\"17.5\" width=\"2\" height=\"10\" fill=\"#FFFFFF\" transform=\"rotate(24 27.5 22.5)\"/>\n                </g></g>\n                <path d=\"M26,17.5 L26,15 A3.5,3.5 0 0 1 29.5,11.5 L34.5,11.5 A3.5,3.5 0 0 1 38,15 L38,17.5\"\n                      fill=\"none\" stroke=\"#92400E\" stroke-width=\"2.6\" stroke-linecap=\"round\"/>\n                <!-- luggage tag: swings from the handle; inner card does the split-flap -->\n                <g id=\"kf-tag\">\n                  <path d=\"M37.5,16 Q39.5,19 39,21.5\" fill=\"none\" stroke=\"#92400E\" stroke-width=\".9\"/>\n                  <g id=\"kf-tagCard\">\n                    <g transform=\"rotate(-10 40 22)\">\n                      <rect x=\"36.8\" y=\"21.5\" width=\"7.6\" height=\"9.6\" rx=\"1.4\" fill=\"#FEF3C7\" stroke=\"#B45309\" stroke-width=\"1\"/>\n                      <circle cx=\"40.6\" cy=\"23.6\" r=\".9\" fill=\"none\" stroke=\"#B45309\" stroke-width=\".8\"/>\n                      <g id=\"kf-tagLines\">\n                        <line x1=\"38.3\" y1=\"26.6\" x2=\"43\" y2=\"26.6\" stroke=\"#D97706\" stroke-width=\".9\" stroke-linecap=\"round\"/>\n                        <line x1=\"38.3\" y1=\"28.5\" x2=\"41.8\" y2=\"28.5\" stroke=\"#D97706\" stroke-width=\".9\" stroke-linecap=\"round\"/>\n                      </g>\n                      <text id=\"kf-tagNum\" x=\"40.6\" y=\"29.6\" text-anchor=\"middle\"\n                            font-family=\"'Trebuchet MS','Segoe UI',sans-serif\" font-size=\"6.5\" font-weight=\"700\"\n                            fill=\"#B45309\">7</text>\n                    </g>\n                  </g>\n                </g>\n              </g>\n\n              <!-- face -->\n              <g id=\"kf-face\">\n                <ellipse cx=\"26.5\" cy=\"40\" rx=\"4.2\" ry=\"4.7\" fill=\"#FFFFFF\" stroke=\"#312E81\" stroke-width=\"1\"/>\n                <ellipse cx=\"37.5\" cy=\"40\" rx=\"4.2\" ry=\"4.7\" fill=\"#FFFFFF\" stroke=\"#312E81\" stroke-width=\"1\"/>\n                <g id=\"kf-pupils\">\n                  <circle cx=\"27.3\" cy=\"40.6\" r=\"2\" fill=\"#1E1B4B\"/>\n                  <circle cx=\"38.3\" cy=\"40.6\" r=\"2\" fill=\"#1E1B4B\"/>\n                  <circle cx=\"28\" cy=\"39.7\" r=\".7\" fill=\"#FFFFFF\"/>\n                  <circle cx=\"39\" cy=\"39.7\" r=\".7\" fill=\"#FFFFFF\"/>\n                </g>\n                <g id=\"kf-lids\">\n                  <rect x=\"22.1\" y=\"35\" width=\"8.8\" height=\"10.4\" rx=\"4.4\" fill=\"#4F46E5\" stroke=\"#312E81\" stroke-width=\".6\"/>\n                  <rect x=\"33.1\" y=\"35\" width=\"8.8\" height=\"10.4\" rx=\"4.4\" fill=\"#4F46E5\" stroke=\"#312E81\" stroke-width=\".6\"/>\n                </g>\n                <!-- happy squint ^ ^ overlay -->\n                <g id=\"kf-squint\">\n                  <path d=\"M23.2,41.2 Q26.5,37.8 29.8,41.2\" fill=\"none\" stroke=\"#1E1B4B\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n                  <path d=\"M34.2,41.2 Q37.5,37.8 40.8,41.2\" fill=\"none\" stroke=\"#1E1B4B\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n                </g>\n                <path d=\"M29.5,46.5 Q32,48.8 34.5,46.5\" fill=\"none\" stroke=\"#1E1B4B\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n                <ellipse cx=\"24\" cy=\"44.6\" rx=\"1.9\" ry=\"1.2\" fill=\"#F9A8D4\" opacity=\".5\"/>\n                <ellipse cx=\"40\" cy=\"44.6\" rx=\"1.9\" ry=\"1.2\" fill=\"#F9A8D4\" opacity=\".5\"/>\n                <!-- sunglasses: slide down once in live mood -->\n                <g id=\"kf-shades\">\n                  <line x1=\"21.6\" y1=\"38.2\" x2=\"9.5\" y2=\"37\" stroke=\"#0F172A\" stroke-width=\"1.2\"/>\n                  <line x1=\"42.4\" y1=\"38.2\" x2=\"55\" y2=\"37.2\" stroke=\"#0F172A\" stroke-width=\"1.2\"/>\n                  <line x1=\"31\" y1=\"38.6\" x2=\"33\" y2=\"38.6\" stroke=\"#0F172A\" stroke-width=\"1.4\"/>\n                  <rect x=\"21.6\" y=\"36\" width=\"9.8\" height=\"6.8\" rx=\"2.8\" fill=\"#0F172A\" stroke=\"#334155\" stroke-width=\".8\"/>\n                  <rect x=\"32.6\" y=\"36\" width=\"9.8\" height=\"6.8\" rx=\"2.8\" fill=\"#0F172A\" stroke=\"#334155\" stroke-width=\".8\"/>\n                  <line x1=\"24\" y1=\"38\" x2=\"26.5\" y2=\"40.5\" stroke=\"#F8FAFC\" stroke-width=\".8\" opacity=\".45\" stroke-linecap=\"round\"/>\n                </g>\n              </g>\n\n              <!-- front arm + pennant (pennant only shows on hype waves) -->\n              <g id=\"kf-armF\">\n                <rect x=\"51.8\" y=\"36.5\" width=\"5\" height=\"12\" rx=\"2.5\" fill=\"#4F46E5\" stroke=\"#312E81\" stroke-width=\"1\"/>\n                <g id=\"kf-flag\">\n                  <rect x=\"53.6\" y=\"47\" width=\"1.4\" height=\"10\" fill=\"#92400E\"/>\n                  <polygon points=\"55,49 63.5,51.5 55,54\" fill=\"#F472B6\" stroke=\"#DB2777\" stroke-width=\".6\"/>\n                </g>\n              </g>\n\n              <!-- tiny fold-out map -->\n              <g id=\"kf-map\">\n                <g transform=\"rotate(-5 36 49.5)\">\n                  <rect x=\"27\" y=\"44\" width=\"18\" height=\"11.5\" rx=\"1\" fill=\"#ECFDF5\" stroke=\"#047857\" stroke-width=\"1\"/>\n                  <line x1=\"33\" y1=\"44\" x2=\"33\" y2=\"55.5\" stroke=\"#A7F3D0\" stroke-width=\"1\"/>\n                  <line x1=\"39\" y1=\"44\" x2=\"39\" y2=\"55.5\" stroke=\"#A7F3D0\" stroke-width=\"1\"/>\n                  <path d=\"M29.5,52 Q33,46.5 36.5,50 T43,47.5\" fill=\"none\" stroke=\"#EF4444\" stroke-width=\"1\"\n                        stroke-dasharray=\"2 1.4\" stroke-linecap=\"round\"/>\n                  <circle cx=\"43\" cy=\"47.5\" r=\"1.1\" fill=\"#EF4444\"/>\n                </g>\n              </g>\n\n              <!-- confetti puff (hype landings + lid pop) -->\n              <g id=\"kf-confetti\">\n                <circle class=\"conf\" cx=\"32\" cy=\"14\" r=\"1.6\" fill=\"#F9A8D4\" style=\"--cx:-14px;--cy:-20px;--cr:120deg\"/>\n                <rect class=\"conf\" x=\"30\" y=\"12\" width=\"3\" height=\"3\" fill=\"#6EE7B7\" style=\"--cx:10px;--cy:-24px;--cr:200deg\"/>\n                <circle class=\"conf\" cx=\"33\" cy=\"13\" r=\"1.3\" fill=\"#FCD34D\" style=\"--cx:18px;--cy:-14px;--cr:90deg\"/>\n                <rect class=\"conf\" x=\"31\" y=\"13\" width=\"2.6\" height=\"2.6\" fill=\"#A5B4FC\" style=\"--cx:-18px;--cy:-10px;--cr:-160deg\"/>\n                <circle class=\"conf\" cx=\"31\" cy=\"12\" r=\"1.2\" fill=\"#FDA4AF\" style=\"--cx:-6px;--cy:-24px;--cr:60deg\"/>\n                <rect class=\"conf\" x=\"32.5\" y=\"12\" width=\"2.4\" height=\"2.4\" fill=\"#7DD3FC\" style=\"--cx:22px;--cy:-20px;--cr:240deg\"/>\n              </g>\n            </g>\n          </g>\n        </g>\n\n        <!-- ground dust puff (feet level, outside #jumper's airborne groups) -->\n        <g id=\"kf-puffG\">\n          <circle class=\"pg\" cx=\"26\" cy=\"66.5\" r=\"1.7\" fill=\"#E2E8F0\" style=\"--px:-9px;--py:-3px\"/>\n          <circle class=\"pg\" cx=\"38\" cy=\"66.5\" r=\"1.5\" fill=\"#F1F5F9\" style=\"--px:9px;--py:-4px\"/>\n          <circle class=\"pg\" cx=\"30\" cy=\"67\" r=\"1.2\" fill=\"#CBD5E1\" style=\"--px:-4px;--py:-7px\"/>\n          <circle class=\"pg\" cx=\"35\" cy=\"67\" r=\"1.3\" fill=\"#E2E8F0\" style=\"--px:5px;--py:-6px\"/>\n        </g>\n\n        <!-- stamp-impact puff (follows --sx/--sy to the sticker slot) -->\n        <g id=\"kf-puffS\">\n          <circle class=\"ps\" cx=\"30\" cy=\"44\" r=\"1.2\" fill=\"#FDE68A\" style=\"--px:-6px;--py:-5px\"/>\n          <circle class=\"ps\" cx=\"34\" cy=\"43.5\" r=\"1\" fill=\"#F1F5F9\" style=\"--px:6px;--py:-4px\"/>\n          <path class=\"ps\" d=\"M32,40.6 L32.7,42.1 L34.2,42.4 L33.1,43.4 L33.4,45 L32,44.2 L30.6,45 L30.9,43.4 L29.8,42.4 L31.3,42.1 Z\"\n                fill=\"#FCD34D\" style=\"--px:1px;--py:-8px\"/>\n          <circle class=\"ps\" cx=\"31\" cy=\"45\" r=\".9\" fill=\"#E2E8F0\" style=\"--px:-3px;--py:-7px\"/>\n        </g>\n\n        <!-- passport stamp rig: descends from above the strip -->\n        <g id=\"kf-stamp\"><g id=\"kf-stampAnim\">\n          <rect x=\"28.4\" y=\"24\" width=\"7.2\" height=\"6.6\" rx=\"3\" fill=\"#B45309\" stroke=\"#7C2D12\" stroke-width=\".9\"/>\n          <rect x=\"30.4\" y=\"29.8\" width=\"3.2\" height=\"7.4\" fill=\"#D97706\" stroke=\"#7C2D12\" stroke-width=\".8\"/>\n          <rect x=\"29.2\" y=\"36.6\" width=\"5.6\" height=\"3\" fill=\"#4F46E5\" stroke=\"#312E81\" stroke-width=\".7\"/>\n          <path d=\"M25,45.5 L25,42.5 Q25,39.6 27.9,39.6 L36.1,39.6 Q39,39.6 39,42.5 L39,45.5 Z\"\n                fill=\"#312E81\" stroke=\"#1E1B4B\" stroke-width=\".9\"/>\n        </g></g>\n      </svg>";
+
+  var SHADOW = "<svg class=\"shadow\" id=\"kf-shadow\" width=\"66\" height=\"10\" viewBox=\"0 0 66 10\" aria-hidden=\"true\">\n    <ellipse cx=\"33\" cy=\"5\" rx=\"29\" ry=\"4\" fill=\"#000\"/>\n  </svg>";
+
+  var FX = "<div class=\"fx\" id=\"kf-fx\">\n    <span class=\"zz z1\">z</span>\n    <span class=\"zz z2\">z</span>\n    <span class=\"zz z3\">z</span>\n  </div>";
+
+  // tag micro-motion + landing dust, shared by several states
+  function twitchTag(k) { k.addC('twitch'); k.later(function () { k.remC('twitch'); }, 600); }
+  function puffGround(k) { k.pulse('puffG', 800); }
+
+  TrekMascots.register({
+    id: 'koffi',
+    name: 'Koffi',
+    tagline: 'the suitcase — packed since Tuesday',
+    width: 72,
+    height: 79,
+    css: CSS,
+    svg: SVG,
+    shadow: SHADOW,
+    fx: FX,
+    moods: ['chill', 'soon', 'hype', 'live'],
+    reducedPose: 'pose-sit',
+    signature: 'lid',
+    shineClasses: ['sh1', 'sh2', 'sh3'],
+    stateClasses: ['st-walk', 'st-idle', 'st-sit', 'st-sleep', 'st-stretch', 'st-wave', 'st-jump',
+      'st-spin', 'st-peek', 'st-map', 'st-lid', 'st-roll', 'st-stamp', 'st-flap',
+      'pose-sit', 'lid-open', 'lid-crack', 'map-open',
+      'look-down', 'look-up', 'look-l', 'look-r', 'eyes-closed', 'hop', 'burst', 'twitch',
+      'roll-out', 'rolling', 'stamping', 'stamp-hit', 'squint', 'flapping', 'tag-num',
+      'puffG', 'puffS', 'stk-b1', 'stk-b2', 'stk-b3', 'stk-b4'],
+    edgeStates: { peek: true },
+    afterState: { sleep: 'stretch', stretch: 'idle' },
+    glide: { state: 'roll', outClass: 'roll-out', spinClass: 'rolling', boost: 1.5 },
+    config: {
+      turnPad: 20,
+      edgeSnap: 34,
+      speed: { chill: 26, soon: 38, hype: 62, live: 33 },
+      step:  { chill: '0.72s', soon: '0.56s', hype: '0.38s', live: '0.66s' },
+      waveEveryMs: 90000,
+      dur: {
+        walk: [2600, 7200], idle: [1500, 3400], sit: [3200, 7500], sleep: [6500, 12000],
+        stretch: [1750, 1750], wave: [2050, 2050], jump: [1050, 1050], spin: [980, 980],
+        peek: [2000, 3400], map: [3900, 3900], lid: [3000, 3000],
+        roll: [4600, 4600], stamp: [3550, 3550], flap: [3300, 3300]
+      },
+      weights: {
+        chill: { walk: 5, idle: 4,   sit: 3,   map: 2.2, wave: .7,  jump: .5,  peek: 1.2, lid: 1.2, spin: 0,   roll: .3,  stamp: .3,  flap: 0 },
+        soon:  { walk: 6, idle: 3,   sit: 1.6, map: 1.6, wave: 1,   jump: 1.7, peek: 1.2, lid: 1.4, spin: .2,  roll: .45, stamp: .35, flap: 0 },
+        hype:  { walk: 7, idle: 1.4, sit: .4,  map: .7,  wave: 2,   jump: 3.4, peek: 1.2, lid: 1.8, spin: .9,  roll: .6,  stamp: .4,  flap: 1.15 },
+        live:  { walk: 5, idle: 3,   sit: 2.2, map: 1,   wave: 1.2, jump: 1.2, peek: 1,   lid: 1.2, spin: 1.9, roll: 1.15, stamp: .45, flap: 0 }
+      },
+      sleepFromSit: { chill: 2.6, soon: 1.2, hype: 0, live: 1 }
+    },
+
+    // stamped-sticker slots: [--sx, --sy] offsets steering the stamp + puff to each spot
+    _slots: [[-5.5, 7.2], [12.9, -.5], [-18.8, 8.5], [16.6, -1.7]],
+
+    onTurn: function (k) { k.pulse('flutter', 640); },   // tag flutters on turn-around
+    onGlideTuck: function (k) { puffGround(k); },
+    filterWeights: function (k, w) {
+      if (!(k.mood === 'hype' && k.tripDays != null)) delete w.flap; // split-flap needs a real countdown
+    },
+    moodFromTrip: function (days, ongoing) {
+      if (ongoing === true) return 'live';
+      if (days !== null && days >= 0 && days <= 7) return 'hype';
+      if (days !== null && days > 7 && days <= 14) return 'soon';
+      return 'chill';
+    },
+    onMood: function (k, m, changed) {
+      if (m === 'live') {
+        if (!k._shadesOn) {
+          k._shadesOn = true;
+          setTimeout(function () { if (k._shadesOn) k.addC('shades-on'); }, 700);
+        }
+      } else if (k._shadesOn) {
+        k._shadesOn = false;
+        k.remC('shades-on');
+      }
+      if (changed && m === 'hype' && !TrekMascots.reduced && (k.state === 'sleep' || k.state === 'sit')) {
+        k.setState(k.state === 'sleep' ? 'stretch' : 'jump');
+      }
+    },
+
+    enter: {
+      walk: function (k) { if (Math.random() < .3) k.setDir(-k.dir); },
+      idle: function (k) {
+        if (Math.random() < .8) k.later(function () {
+          k.addC(Math.random() < .5 ? 'look-l' : 'look-r');
+          k.later(function () { k.remC('look-l'); k.remC('look-r'); }, k.rand(500, 900));
+        }, k.rand(300, 1200));
+        if (Math.random() < .5) k.later(function () { twitchTag(k); }, k.rand(600, 1800));
+      },
+      sit: function (k) {
+        k.addC('pose-sit');
+        if (Math.random() < .6) k.later(function () { twitchTag(k); }, k.rand(1000, 3000));
+      },
+      sleep: function (k) { k.addC('pose-sit'); },
+      stretch: function (k) { k.addC('eyes-closed'); k.later(function () { k.remC('eyes-closed'); }, 650); },
+      wave: function (k) {
+        k.lastWave = performance.now();
+        k.later(function () { k.addC('squint'); }, 450);
+        k.later(function () { k.remC('squint'); }, 1550);
+      },
+      jump: function (k) {
+        k.later(function () { k.addC('squint'); }, 300);
+        k.later(function () { k.remC('squint'); }, 700);
+        k.later(function () { puffGround(k); }, 770);   // dust on landing
+        if (k.mood === 'hype') {
+          k.later(function () { k.addC('lid-crack'); }, 140);
+          k.later(function () { k.remC('lid-crack'); }, 620);
+          k.later(function () { k.pulse('burst'); }, 640); // confetti pops on the way down, never at apex
+        }
+      },
+      spin: function () {},
+      peek: function (k) {
+        k.setDir(k.x - k.minX < k.maxX - k.x ? -1 : 1);
+        k.later(function () { k.addC('look-down'); }, 380);
+      },
+      map: function (k) {
+        k.later(function () { k.addC('map-open'); }, 260);
+        k.later(function () { k.addC('look-down'); }, 620);
+        k.later(function () { k.remC('look-down'); k.addC('look-up'); }, 2150);
+        k.later(function () { k.remC('look-up'); k.addC('look-down'); }, 2800);
+        k.later(function () { k.remC('map-open'); k.remC('look-down'); }, 3350);
+      },
+      // signature move: the Lid Pop — postcard peeks out of the cracked lid
+      lid: function (k) {
+        k.later(function () { k.addC('lid-open'); k.addC('look-up'); if (k.mood === 'hype') k.pulse('burst'); }, 220);
+        k.later(function () { k.remC('lid-open'); }, 2150);
+        k.later(function () { k.remC('look-up'); k.addC('hop'); }, 2400);
+      },
+      // trolley mode: wheels pop, handle telescopes out, lean back and glide
+      roll: function (k) {
+        k.setDir(k.x - k.minX < k.maxX - k.x ? 1 : -1);  // roll toward the long side
+        k.forceNext = 'walk';                            // always resume walking after
+        k.glideTucked = false;
+        k.addC('roll-out');
+        k.later(function () { k.glideMoving = true; k.addC('rolling'); }, 430);
+        k.later(function () {                            // bump over an imaginary crack
+          if (k.glideMoving) { k.addC('hop'); k.later(function () { k.remC('hop'); }, 470); }
+        }, k.rand(1500, 2700));
+        k.later(function () { k.tuckGlide(); }, 3550);   // snap everything away, dust settles
+      },
+      // passport control: a chunky stamp descends and awards a sticker
+      stamp: function (k) {
+        var count = k._stamps || 0;
+        var n = count < 4 ? count + 1 : 1 + Math.floor(Math.random() * 4);
+        var slot = TrekMascots.get('koffi')._slots[n - 1];
+        k.el.style.setProperty('--sx', slot[0] + 'px');
+        k.el.style.setProperty('--sy', slot[1] + 'px');
+        k.later(function () { k.addC('stamping'); }, 120);
+        k.later(function () { k.addC('look-up'); }, 320);
+        k.later(function () {                            // impact frame
+          k.remC('look-up');
+          k.addC('stamp-hit');
+          k.pulse('puffS');
+          if (count < 4) { k.addC('stk-on-' + n); k._stamps = count + 1; }
+          else { k.addC('stk-b' + n); k.later(function () { k.remC('stk-b' + n); }, 650); }
+        }, 1030);
+        k.later(function () { k.remC('stamp-hit'); k.remC('puffS'); }, 1700);
+        k.later(function () { k.addC('look-down'); }, 2000);  // admire the new sticker
+        k.later(function () { k.addC('squint'); }, 2250);
+        k.later(function () { k.addC('hop'); }, 2450);
+        k.later(function () { k.remC('hop'); }, 2950);
+        k.later(function () { k.remC('squint'); k.remC('look-down'); }, 3150);
+      },
+      // airport split-flap: the tag flips and shows days-until-trip (hype only)
+      flap: function (k) {
+        var d = TrekMascots.clamp(Math.round(k.tripDays == null ? 0 : k.tripDays), 0, 99);
+        k.later(function () { k.addC('look-up'); }, 200);
+        k.later(function () { k.addC('flapping'); }, 350);
+        k.later(function () {                            // swap content mid-flap
+          var tagNum = k.el.querySelector('#kf-tagNum');
+          if (tagNum) tagNum.textContent = String(d);
+          k.addC('tag-num');
+        }, 760);
+        k.later(function () { k.remC('flapping'); }, 1250);
+        k.later(function () { k.addC('squint'); }, 1500);
+        k.later(function () { k.addC('hop'); }, 1600);
+        k.later(function () { k.remC('hop'); k.remC('squint'); }, 2150);
+        k.later(function () { k.remC('look-up'); }, 2600);
+      }
+    }
+  });
+})();
+</script>
+<!-- characters/chiki.js -->
+<script>
+// Chiki -- a golden konbini karaage living in its red-striped paper pouch.
+// Same contract as Koffi: pure data + choreography on the shared engine.
+// The chicken and the pouch are separate rigs; the duck signature slides the
+// chicken down INTO the pouch, so draw order is back panel / chicken / front
+// panel and the front rim naturally hides whatever sinks below y=33.
+(function () {
+  'use strict';
+
+  var CSS = "\n\n  /* ---- moving root: JS drives translate3d(x) ---- */\n\n#m-chiki .jumper, #m-chiki .flip { position: absolute; inset: 0; }\n#m-chiki .jumper { transform-origin: 50% 100%; }\n#m-chiki .flip { transition: transform .26s ease; transform-origin: 50% 50%; }\n\n#m-chiki .char {\n    display: block;\n    position: absolute;\n    left: 0;\n    bottom: 0;\n    overflow: visible;\n    /* rim: dark shadow + faint light halo so Chiki reads on any hero image */\n    filter: drop-shadow(0 1px 1px rgba(2,6,23,.35)) drop-shadow(0 0 1px rgba(248,250,252,.3));\n  }\n\n  /* ---- ground shadow ---- */\n#m-chiki .shadow {\n    position: absolute;\n    left: 50%;\n    bottom: 0;\n    margin-left: -30px;\n    opacity: .17;\n    filter: blur(1.1px);\n    transform-origin: 50% 100%;\n    transition: transform .4s ease, opacity .4s ease;\n  }\n#m-chiki.pose-sit .shadow { transform: scaleX(1.1); opacity: .21; }\n\n  /* ---- SVG group plumbing: CSS transforms in viewBox units ---- */\n  #ck-root, #ck-body, #ck-pouch, #ck-legL, #ck-legR, #ck-chick, #ck-breathe, #ck-face, #ck-nubL, #ck-nubR, #ck-pupils, #ck-lids, #ck-squint, #ck-steam, #ck-priceCard, #ck-tourTag { transform-box: view-box; }\n\n#ck-root { transform-origin: 30px 64px; transition: transform .5s cubic-bezier(.4,0,.3,1); }\n#ck-body { transform-origin: 30px 57px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n#ck-pouch { transform-origin: 30px 57px; }\n#ck-legL { transform-origin: 23px 56px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n#ck-legR { transform-origin: 37px 56px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n#ck-chick { transform-origin: 30px 38px; transition: transform .34s cubic-bezier(.34,1.3,.64,1); }\n#ck-breathe { transform-origin: 30px 36px; animation: ckBreathe 3.6s ease-in-out infinite; }\n#ck-face { transform-origin: 30px 26px; }\n#ck-nubL { transform-origin: 17px 26px; transform: rotate(4deg); transition: transform .3s ease; }\n#ck-nubR { transform-origin: 43px 26px; transform: rotate(-4deg); transition: transform .3s ease; }\n#ck-lids { transform-origin: 30px 19.8px; transform: scaleY(0); transition: transform .09s ease-out; }\n#ck-pupils { transform-origin: 30px 24px; transition: transform .3s ease, opacity .12s ease; animation: ckDrift 9s ease-in-out infinite; }\n#ck-squint { opacity: 0; transition: opacity .12s ease; }\n#ck-jaw { transform-box: fill-box; transform-origin: center; }\n\n  /* ---- steam: always on; moods turn the burner up or down ---- */\n#ck-steam { transform-origin: 30px 10px; transition: transform .45s ease, opacity .35s ease; opacity: .55; }\n#m-chiki .wisp { transform-box: fill-box; transform-origin: 50% 100%; opacity: 0; animation: ckSteamRise 3.4s ease-in-out infinite; }\n#ck-s2 { animation-delay: 1.15s; }\n#ck-s3 { animation-delay: 2.2s; }\n#m-chiki.mood-lukewarm #ck-s3 { animation: none; }\n#m-chiki.mood-warm #ck-steam { opacity: .78; }\n#m-chiki.mood-warm .wisp { animation-duration: 2.9s; }\n#m-chiki.mood-fresh #ck-steam { opacity: 1; }\n#m-chiki.mood-fresh .wisp { animation-duration: 2.3s; }\n#m-chiki.mood-ontour #ck-steam { opacity: .8; }\n#m-chiki.st-sleep #ck-steam { opacity: .28; }\n#m-chiki.st-sleep .wisp { animation-duration: 6.5s; }\n#m-chiki.duck-in #ck-steam, #m-chiki.duck-peek #ck-steam { opacity: 0; }\n\n  /* ---- eyes ---- */\n#m-chiki.blink #ck-lids, #m-chiki.st-sleep #ck-lids, #m-chiki.eyes-closed #ck-lids { transform: scaleY(1); }\n#m-chiki.look-down #ck-pupils { animation: none; transform: translate(.8px, 1.9px); }\n#m-chiki.look-up   #ck-pupils { animation: none; transform: translate(.5px, -2px); }\n#m-chiki.look-l    #ck-pupils { animation: none; transform: translate(-1.4px, .2px); }\n#m-chiki.look-r    #ck-pupils { animation: none; transform: translate(1.4px, .2px); }\n#m-chiki.squint #ck-pupils { opacity: 0; }\n#m-chiki.squint #ck-squint { opacity: 1; }\n#m-chiki.panic #ck-pupils { animation: none; transform: scale(1.32); }\n#m-chiki.panic #ck-nubL { animation: ckFlail .26s ease-in-out infinite; }\n#m-chiki.panic #ck-nubR { animation: ckFlail .26s ease-in-out infinite; animation-delay: -.13s; }\n\n  /* ---- paper crinkle (idle micro-motion + turn-arounds) ---- */\n#m-chiki.crinkle #ck-pouch { animation: ckCrinkle .55s ease-in-out; }\n\n  /* ---- walk: pouch waddle, chicken counter-bob, steam trails back ---- */\n#m-chiki.st-walk #ck-legL { animation: ckStep var(--step) ease-in-out infinite; }\n#m-chiki.st-walk #ck-legR { animation: ckStep var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -2); }\n#m-chiki.st-walk #ck-pouch { animation: ckRock var(--step) ease-in-out infinite; }\n#m-chiki.st-walk #ck-chick { animation: ckBobC calc(var(--step) / 2) ease-in-out infinite; animation-delay: calc(var(--step) / -4); }\n#m-chiki.st-walk #ck-face { animation: ckJig calc(var(--step) / 2) ease-in-out infinite; animation-delay: calc(var(--step) / -10); }\n#m-chiki.st-walk #ck-steam { animation: ckSteamTrail var(--step) ease-in-out infinite; }\n\n  /* ---- sit / sleep pose ---- */\n#m-chiki.pose-sit #ck-body { transform: translateY(4.5px); }\n#m-chiki.pose-sit #ck-legL { transform: translate(3px, 4.5px) rotate(48deg); }\n#m-chiki.pose-sit #ck-legR { transform: translate(-3px, 4.5px) rotate(-48deg); }\n#m-chiki.pose-sit #ck-chick { transform: translateY(2.5px); }\n#m-chiki.st-sleep #ck-chick { transform: translateY(7.5px) rotate(-3deg); }\n#m-chiki.st-sleep #ck-breathe { animation-name: ckBreatheDeep; animation-duration: 4.8s; }\n\n  /* ---- sleep z's (outside the flip wrapper: glyphs never mirror) ---- */\n#m-chiki .fx { position: absolute; inset: 0; pointer-events: none; }\n#m-chiki .zz {\n    position: absolute; top: 4px; opacity: 0;\n    font: italic 700 12px/1 \"Trebuchet MS\", \"Segoe UI\", sans-serif;\n    color: #FEF3C7;\n    text-shadow: 0 1px 2px rgba(69,26,3,.7);\n  }\n#m-chiki .z1 { left: 36px; }\n#m-chiki .z2 { left: 27px; }\n#m-chiki .z3 { left: 43px; }\n#m-chiki.st-sleep .z1 { animation: ckZ 2.8s ease-in-out infinite; }\n#m-chiki.st-sleep .z2 { animation: ckZ 2.8s ease-in-out .9s infinite; }\n#m-chiki.st-sleep .z3 { animation: ckZ 2.8s ease-in-out 1.8s infinite; }\n\n  /* ---- state one-shots ---- */\n#m-chiki.st-wave #ck-nubR { animation: ckWave 1.9s ease-in-out; }\n\n#m-chiki.st-jump .jumper { animation: ckJump .95s cubic-bezier(.4,0,.4,1); }\n#m-chiki.st-jump .shadow { animation: ckShadowJump .95s cubic-bezier(.4,0,.4,1); }\n\n#m-chiki.hop .jumper { animation: ckHop .45s ease-in-out; }\n#m-chiki.hop .shadow { animation: ckShadowHop .45s ease-in-out; }\n\n#m-chiki.st-peek #ck-root { transform: rotate(8deg) translateX(1.5px); }\n\n#m-chiki.st-stretch #ck-root { animation: ckStretch 1.7s ease-in-out; }\n#m-chiki.st-stretch #ck-nubL { animation: ckNubStretchB 1.7s ease-in-out; }\n#m-chiki.st-stretch #ck-nubR { animation: ckNubStretchF 1.7s ease-in-out; }\n#m-chiki.st-stretch #ck-chick { animation: ckChickRise 1.7s ease-in-out; }\n\n  /* ---- duck (signature): drop in, peek over the rim, pop back out ---- */\n#m-chiki.psquash #ck-pouch { animation: ckPSquash .5s ease-out; }\n#m-chiki.duck-in #ck-chick { transform: translateY(16px); transition: transform .3s cubic-bezier(.55,0,.8,.6); }\n#m-chiki.duck-peek #ck-chick { transform: translateY(8.5px); transition: transform .4s cubic-bezier(.34,1.3,.64,1); }\n#m-chiki.popout #ck-chick { animation: ckPop .6s cubic-bezier(.3,1.5,.5,1); }\n\n  /* ---- steam state: burner on max ---- */\n#m-chiki.st-steam #ck-steam { opacity: 1; transform: scale(1.3); }\n#m-chiki.st-steam .wisp { animation-duration: 1.9s; }\n#m-chiki.st-steam #ck-chick { animation: ckWiggle 2.6s ease-in-out; }\n\n  /* ---- nibble: lean to the rim, chew, crumbs drop ---- */\n#m-chiki.st-nibble #ck-chick { transform: translate(1.5px, 5.5px) rotate(9deg); transition: transform .5s cubic-bezier(.4,0,.3,1); }\n#m-chiki.munch #ck-jaw { animation: ckChew .3s ease-in-out infinite; }\n#m-chiki.crumbfall .cf { animation: ckCrumbFall .7s ease-in forwards; }\n\n  /* ---- wobble: pouch tips past balance, teeters, recovers ---- */\n#m-chiki.st-wobble #ck-root { animation: ckTip 2.75s cubic-bezier(.45,.05,.55,.95); }\n#m-chiki.st-wobble .shadow { animation: ckShadowTip 2.75s ease-in-out; }\n\n  /* ---- season: wet-dog shake, spice flies ---- */\n#m-chiki.st-season #ck-root { animation: ckShakeR 2.35s ease-in-out; }\n#m-chiki.spicefly .spk { animation: ckSpice .8s ease-out forwards; }\n#m-chiki.spicefly .spk:nth-child(2n) { animation-duration: .95s; }\n\n  /* ---- price sticker split-flap + unmirrored number ---- */\n#ck-priceCard { transform-origin: 39.6px 46.8px; }\n#ck-priceNum { opacity: 0; transform-box: fill-box; transform-origin: center; transition: opacity .18s ease; }\n#ck-priceLines { transition: opacity .18s ease; }\n#m-chiki.flipped #ck-priceNum { transform: scaleX(-1); } /* counter-flip: glyphs never mirror */\n#m-chiki.price-num #ck-priceNum { opacity: 1; }\n#m-chiki.price-num #ck-priceLines { opacity: 0; }\n#m-chiki.flipping #ck-priceCard { animation: ckFlip .82s ease-in-out; }\n\n  /* ---- airport-tag sticker: slides in once on tour ---- */\n#ck-tourTag { transform: translateY(-8px); opacity: 0; transition: transform .6s cubic-bezier(.34,1.56,.64,1) .1s, opacity .3s ease .1s; }\n#m-chiki.tour-on #ck-tourTag { transform: translateY(0); opacity: .95; }\n\n  /* ---- grease glints + particles ---- */\n#m-chiki .streak { transform-box: view-box; opacity: 0; }\n#m-chiki .crumb, #m-chiki .bp, #m-chiki .spk, #m-chiki .cf, #m-chiki .pg { opacity: 0; transform-box: fill-box; transform-origin: center; }\n#m-chiki.sh1 #ck-shine1 { animation: ckShine .9s ease-in-out; }\n#m-chiki.sh2 #ck-shine2 { animation: ckShine .8s ease-in-out; }\n#m-chiki.burst .bp { animation: ckBurstPuff .7s ease-out; }\n#m-chiki.burst .crumb, #m-chiki.crumbs .crumb { animation: ckCrumb .85s ease-out forwards; }\n#m-chiki.burst .crumb:nth-child(2n) { animation-duration: .7s; }\n#m-chiki.puffG .pg { animation: ckPuff .6s ease-out; }\n\n  /* ---- keyframes ---- */\n  @keyframes ckStep    { 0%,100% { transform: rotate(18deg); } 50% { transform: rotate(-18deg); } }\n  @keyframes ckRock    { 0%,100% { transform: rotate(-6deg); } 50% { transform: rotate(6deg); } }\n  @keyframes ckBobC    { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-1.6px); } }\n  @keyframes ckJig     { 0%,100% { transform: translateY(0); } 50% { transform: translateY(.7px); } }\n  @keyframes ckSteamTrail { 0%,100% { transform: translateX(-2px) rotate(4deg); } 50% { transform: translateX(-3px) rotate(6deg); } }\n  @keyframes ckBreathe     { 0%,100% { transform: scale(1); } 50% { transform: scale(1.012, 1.03); } }\n  @keyframes ckBreatheDeep { 0%,100% { transform: scale(1); } 50% { transform: scale(1.02, 1.05); } }\n  @keyframes ckDrift {\n    0%,100% { transform: translate(0,0); }\n    22%     { transform: translate(.7px,.3px); }\n    48%     { transform: translate(-.6px,.5px); }\n    72%     { transform: translate(.3px,-.3px); }\n  }\n  @keyframes ckSteamRise {\n    0%   { opacity: 0; transform: translateY(3px) scale(.7); }\n    25%  { opacity: .9; }\n    60%  { opacity: .5; }\n    100% { opacity: 0; transform: translateY(-7px) scale(1.15); }\n  }\n  @keyframes ckZ {\n    0%   { opacity: 0; transform: translate(0, 6px) scale(.6); }\n    25%  { opacity: .9; }\n    100% { opacity: 0; transform: translate(10px, -24px) scale(1.35); }\n  }\n  @keyframes ckJump {\n    0%   { transform: translateY(0)     scale(1); }\n    16%  { transform: translateY(0)     scale(1.12, .82); }  /* anticipation squash */\n    28%  { transform: translateY(-9px)  scale(.94, 1.08); }  /* launch stretch */\n    50%  { transform: translateY(-26px) scale(1, 1.02); }\n    72%  { transform: translateY(-2px)  scale(.98, 1.02); }\n    82%  { transform: translateY(0)     scale(1.14, .82); }  /* landing squash */\n    92%  { transform: translateY(0)     scale(.97, 1.03); }\n    100% { transform: translateY(0)     scale(1); }\n  }\n  @keyframes ckShadowJump {\n    0%   { transform: scale(1); opacity: .17; }\n    16%  { transform: scale(1.08, 1); opacity: .2; }\n    50%  { transform: scale(.55); opacity: .06; }\n    82%  { transform: scale(1.14, 1); opacity: .22; }\n    100% { transform: scale(1); opacity: .17; }\n  }\n  @keyframes ckHop {\n    0%   { transform: translateY(0)    scale(1); }\n    25%  { transform: translateY(0)    scale(1.06, .9); }\n    55%  { transform: translateY(-8px) scale(.98, 1.04); }\n    85%  { transform: translateY(0)    scale(1.05, .94); }\n    100% { transform: translateY(0)    scale(1); }\n  }\n  @keyframes ckShadowHop { 0%,100% { transform: scale(1); opacity: .17; } 55% { transform: scale(.85); opacity: .12; } }\n  @keyframes ckWave {\n    0%   { transform: rotate(-4deg); }\n    18%  { transform: rotate(-138deg); }\n    32%  { transform: rotate(-116deg); }\n    46%  { transform: rotate(-142deg); }\n    60%  { transform: rotate(-116deg); }\n    74%  { transform: rotate(-138deg); }\n    100% { transform: rotate(-4deg); }\n  }\n  @keyframes ckStretch {\n    0%   { transform: scale(1); }\n    30%  { transform: scale(.96, 1.06); }\n    62%  { transform: scale(.96, 1.065); }\n    82%  { transform: scale(1.04, .95); }\n    100% { transform: scale(1); }\n  }\n  @keyframes ckNubStretchF { 0%,100% { transform: rotate(-4deg); } 30%,65% { transform: rotate(-160deg); } }\n  @keyframes ckNubStretchB { 0%,100% { transform: rotate(4deg); }  30%,65% { transform: rotate(160deg); } }\n  @keyframes ckChickRise   { 0%,100% { transform: translateY(0); } 30%,65% { transform: translateY(-3.5px); } }\n  @keyframes ckPSquash { 0% { transform: scale(1); } 35% { transform: scale(1.08, .88); } 70% { transform: scale(.97, 1.03); } 100% { transform: scale(1); } }\n  @keyframes ckPop {\n    0%   { transform: translateY(9px)  scale(.9, 1.05); }\n    45%  { transform: translateY(-4px) scale(.96, 1.06); }\n    72%  { transform: translateY(1px)  scale(1.05, .95); }\n    100% { transform: translateY(0)    scale(1); }\n  }\n  @keyframes ckWiggle {\n    0%,100% { transform: rotate(0); }\n    15% { transform: rotate(-2.5deg); }\n    30% { transform: rotate(2.5deg); }\n    45% { transform: rotate(-2deg); }\n    60% { transform: rotate(2deg); }\n    78% { transform: rotate(-1deg); }\n  }\n  @keyframes ckChew { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(1.9) translateY(.4px); } }\n  @keyframes ckCrumbFall {\n    0%   { opacity: 0; transform: translate(0,0) rotate(0); }\n    15%  { opacity: .95; }\n    100% { opacity: 0; transform: translate(var(--fx, 2px), 12px) rotate(70deg); }\n  }\n  @keyframes ckTip {\n    0%   { transform: rotate(0); }\n    16%  { transform: rotate(-4deg); }    /* counter-lean before losing it */\n    30%  { transform: rotate(11deg); }\n    42%  { transform: rotate(13.5deg); }\n    55%  { transform: rotate(12deg); }\n    68%  { transform: rotate(13.5deg); }  /* teeter on the fold */\n    80%  { transform: rotate(-5deg); }\n    90%  { transform: rotate(3deg); }\n    100% { transform: rotate(0); }\n  }\n  @keyframes ckShadowTip { 0%,100% { transform: scale(1); opacity: .17; } 45% { transform: scaleX(.8); opacity: .12; } }\n  @keyframes ckFlail { 0%,100% { transform: rotate(-32deg); } 50% { transform: rotate(42deg); } }\n  @keyframes ckShakeR {\n    0%   { transform: rotate(0); }\n    10%  { transform: rotate(-8deg); }\n    18%  { transform: rotate(7deg); }\n    26%  { transform: rotate(-7deg); }\n    34%  { transform: rotate(7deg); }\n    42%  { transform: rotate(-6deg); }\n    50%  { transform: rotate(6deg); }\n    60%  { transform: rotate(-4deg); }\n    72%  { transform: rotate(3deg); }\n    84%  { transform: rotate(-1.5deg); }\n    100% { transform: rotate(0); }\n  }\n  @keyframes ckSpice {\n    0%   { opacity: 0; transform: translate(0,0) scale(.4) rotate(0); }\n    12%  { opacity: 1; }\n    100% { opacity: 0; transform: translate(var(--cx), var(--cy)) scale(1.05) rotate(var(--cr)); }\n  }\n  @keyframes ckFlip {\n    0%,25%,50%,75%,100%        { transform: scaleY(1); }\n    12.5%,37.5%,62.5%,87.5%    { transform: scaleY(.08); }\n  }\n  @keyframes ckShine {\n    0%   { opacity: 0; transform: translateX(-6px); }\n    20%  { opacity: .85; }\n    100% { opacity: 0; transform: translateX(9px); }\n  }\n  @keyframes ckBurstPuff {\n    0%   { opacity: 0; transform: translate(0,0) scale(.5); }\n    15%  { opacity: .85; }\n    100% { opacity: 0; transform: translate(var(--px, 0px), var(--py, -14px)) scale(1.6); }\n  }\n  @keyframes ckCrumb {\n    0%   { opacity: 0; transform: translate(0,0) scale(.4) rotate(0); }\n    12%  { opacity: 1; }\n    100% { opacity: 0; transform: translate(var(--cx), var(--cy)) scale(1) rotate(var(--cr)); }\n  }\n  @keyframes ckPuff {\n    0%   { opacity: 0; transform: translate(0,0) scale(.4); }\n    18%  { opacity: .55; }\n    100% { opacity: 0; transform: translate(var(--px), var(--py)) scale(1.25); }\n  }\n  @keyframes ckCrinkle { 0%,100% { transform: scale(1) rotate(0); } 30% { transform: scale(1.025, .975) rotate(.6deg); } 65% { transform: scale(.985, 1.015) rotate(-.5deg); } }\n\n  /* ---- reduced motion: freeze the always-on loops, keep a soft steam hint ---- */\n  @media (prefers-reduced-motion: reduce) {\n    #m-chiki .wisp { animation: none; opacity: .3; }\n    #ck-breathe, #ck-pupils { animation: none; }\n  }\n";
+
+  var SVG = "<svg class=\"char\" id=\"ck-chiki\" width=\"66\" height=\"72.6\" viewBox=\"0 0 60 66\" aria-hidden=\"true\" xmlns=\"http://www.w3.org/2000/svg\">\n        <title>Chiki the konbini karaage</title>\n        <defs>\n          <clipPath id=\"ck-cpPouch\"><path d=\"M13,33 L47,33 L44,55 Q43.7,57.5 41.2,57.5 L18.8,57.5 Q16.3,57.5 16,55 Z\"/></clipPath>\n          <clipPath id=\"ck-cpSh1\"><ellipse cx=\"24\" cy=\"15\" rx=\"4.4\" ry=\"3\" transform=\"rotate(-18 24 15)\"/></clipPath>\n          <clipPath id=\"ck-cpSh2\"><ellipse cx=\"38.5\" cy=\"18\" rx=\"3.6\" ry=\"2.6\" transform=\"rotate(14 38.5 18)\"/></clipPath>\n        </defs>\n        <g id=\"ck-root\">\n          <!-- paper-fold legs -->\n          <g id=\"ck-legL\">\n            <rect x=\"19.8\" y=\"55\" width=\"6.4\" height=\"8\" rx=\"3\" fill=\"#FEF2F2\" stroke=\"#9F1239\" stroke-width=\".8\"/>\n            <line x1=\"21\" y1=\"58.5\" x2=\"25\" y2=\"58.2\" stroke=\"#FCA5A5\" stroke-width=\".7\"/>\n            <ellipse cx=\"23\" cy=\"63.7\" rx=\"4.6\" ry=\"2.2\" fill=\"#FECACA\" stroke=\"#9F1239\" stroke-width=\".8\"/>\n          </g>\n          <g id=\"ck-legR\">\n            <rect x=\"33.8\" y=\"55\" width=\"6.4\" height=\"8\" rx=\"3\" fill=\"#FEF2F2\" stroke=\"#9F1239\" stroke-width=\".8\"/>\n            <line x1=\"35\" y1=\"58.2\" x2=\"39\" y2=\"58.5\" stroke=\"#FCA5A5\" stroke-width=\".7\"/>\n            <ellipse cx=\"37\" cy=\"63.7\" rx=\"4.6\" ry=\"2.2\" fill=\"#FECACA\" stroke=\"#9F1239\" stroke-width=\".8\"/>\n          </g>\n\n          <g id=\"ck-body\">\n            <!-- pouch back panel: the chicken sits in front of this, behind the front -->\n            <g id=\"ck-pouchBack\">\n              <path d=\"M14.5,31 L45.5,31 L43.4,53.5 Q43.2,55.5 41,55.5 L19,55.5 Q16.8,55.5 16.6,53.5 Z\"\n                    fill=\"#FECACA\" stroke=\"#9F1239\" stroke-width=\"1\" stroke-linejoin=\"round\"/>\n              <path d=\"M15.5,31.8 L44.5,31.8 L44.2,34.8 L15.8,34.8 Z\" fill=\"#FCA5A5\" opacity=\".6\"/>\n            </g>\n\n            <!-- chicken -->\n            <g id=\"ck-chick\">\n              <g id=\"ck-breathe\">\n                <!-- steam wisps: the always-on tell that Chiki is fresh out of the fryer -->\n                <g id=\"ck-steam\" fill=\"none\" stroke-linecap=\"round\">\n                  <path id=\"ck-s1\" class=\"wisp\" d=\"M23.5,10 Q21.5,7.5 23.5,5 Q25.5,2.8 23.8,0.5\" stroke=\"#F8FAFC\" stroke-width=\"1.3\"/>\n                  <path id=\"ck-s2\" class=\"wisp\" d=\"M30.5,8.5 Q28.4,6 30.5,3.5 Q32.6,1.2 30.8,-1.2\" stroke=\"#F1F5F9\" stroke-width=\"1.4\"/>\n                  <path id=\"ck-s3\" class=\"wisp\" d=\"M37,10.5 Q35.2,8.2 37,6 Q38.8,3.8 37.3,1.6\" stroke=\"#F8FAFC\" stroke-width=\"1.1\"/>\n                </g>\n\n                <!-- crust nubs (wing lumps, painted behind the crust) -->\n                <g id=\"ck-nubL\">\n                  <path d=\"M18.5,22.5 Q13.5,23 13,27 Q13.2,30.5 17.5,30.5 Z\" fill=\"#F59E0B\" stroke=\"#92400E\" stroke-width=\"1.2\" stroke-linejoin=\"round\"/>\n                </g>\n                <g id=\"ck-nubR\">\n                  <path d=\"M41.5,22.5 Q46.5,23 47,27 Q46.8,30.5 42.5,30.5 Z\" fill=\"#F59E0B\" stroke=\"#92400E\" stroke-width=\"1.2\" stroke-linejoin=\"round\"/>\n                </g>\n\n                <!-- bumpy crust body -->\n                <path id=\"ck-crust\" d=\"M19,38.5 Q15.5,36.5 15.8,32.5 Q13.6,30 15,26.5 Q13.8,22.5 16.8,20 Q16.4,15.5 20.4,13.8 Q21.4,9.6 25.6,9.6 Q28,6.8 31.4,8.4 Q35.4,6.9 37.6,10.2 Q41.8,10.6 42.6,14.6 Q46.2,16.4 45.4,20.4 Q47.8,23.6 46,27 Q47.4,30.6 44.8,33 Q45,36.8 41.4,38.6 Q36,40.8 30,40.8 Q24,40.8 19,38.5 Z\"\n                      fill=\"#F59E0B\" stroke=\"#92400E\" stroke-width=\"1.5\" stroke-linejoin=\"round\"/>\n\n                <!-- crust patches + crumb texture -->\n                <path d=\"M20.5,14.8 Q23,12.4 26,13.6 Q24,16.6 20.5,14.8 Z\" fill=\"#FBBF24\" opacity=\".8\"/>\n                <ellipse cx=\"35\" cy=\"13.5\" rx=\"2.6\" ry=\"1.6\" fill=\"#D97706\" opacity=\".5\" transform=\"rotate(15 35 13.5)\"/>\n                <ellipse cx=\"19.5\" cy=\"27\" rx=\"2\" ry=\"1.3\" fill=\"#D97706\" opacity=\".5\" transform=\"rotate(-20 19.5 27)\"/>\n                <ellipse cx=\"41.5\" cy=\"30\" rx=\"2.2\" ry=\"1.4\" fill=\"#B45309\" opacity=\".4\" transform=\"rotate(18 41.5 30)\"/>\n                <circle cx=\"24\" cy=\"33.5\" r=\"1\" fill=\"#B45309\" opacity=\".45\"/>\n                <circle cx=\"38\" cy=\"34.5\" r=\".8\" fill=\"#D97706\" opacity=\".5\"/>\n\n                <!-- sesame flecks -->\n                <ellipse cx=\"27\" cy=\"11.8\" rx=\"1\" ry=\".55\" fill=\"#FFFBEB\" stroke=\"#D97706\" stroke-width=\".4\" transform=\"rotate(-24 27 11.8)\"/>\n                <ellipse cx=\"40\" cy=\"17.5\" rx=\".9\" ry=\".5\" fill=\"#FFFBEB\" stroke=\"#D97706\" stroke-width=\".4\" transform=\"rotate(30 40 17.5)\"/>\n\n                <!-- grease glints (clipped to two crust spots) -->\n                <g clip-path=\"url(#ck-cpSh1)\"><g id=\"ck-shine1\" class=\"streak\">\n                  <rect x=\"23\" y=\"10.5\" width=\"1.8\" height=\"9\" fill=\"#FFFFFF\" transform=\"rotate(22 24 15)\"/>\n                </g></g>\n                <g clip-path=\"url(#ck-cpSh2)\"><g id=\"ck-shine2\" class=\"streak\">\n                  <rect x=\"37.8\" y=\"14\" width=\"1.6\" height=\"8\" fill=\"#FFFFFF\" transform=\"rotate(22 38.5 18)\"/>\n                </g></g>\n\n                <!-- face -->\n                <g id=\"ck-face\">\n                  <ellipse cx=\"24.5\" cy=\"24\" rx=\"3.7\" ry=\"4.1\" fill=\"#FFFFFF\" stroke=\"#92400E\" stroke-width=\"1\"/>\n                  <ellipse cx=\"35.5\" cy=\"24\" rx=\"3.7\" ry=\"4.1\" fill=\"#FFFFFF\" stroke=\"#92400E\" stroke-width=\"1\"/>\n                  <g id=\"ck-pupils\">\n                    <circle cx=\"25.2\" cy=\"24.5\" r=\"1.8\" fill=\"#451A03\"/>\n                    <circle cx=\"36.2\" cy=\"24.5\" r=\"1.8\" fill=\"#451A03\"/>\n                    <circle cx=\"25.8\" cy=\"23.7\" r=\".6\" fill=\"#FFFFFF\"/>\n                    <circle cx=\"36.8\" cy=\"23.7\" r=\".6\" fill=\"#FFFFFF\"/>\n                  </g>\n                  <g id=\"ck-lids\">\n                    <rect x=\"20.6\" y=\"19.4\" width=\"7.8\" height=\"9.2\" rx=\"3.9\" fill=\"#F59E0B\" stroke=\"#92400E\" stroke-width=\".6\"/>\n                    <rect x=\"31.6\" y=\"19.4\" width=\"7.8\" height=\"9.2\" rx=\"3.9\" fill=\"#F59E0B\" stroke=\"#92400E\" stroke-width=\".6\"/>\n                  </g>\n                  <!-- happy squint ^ ^ overlay -->\n                  <g id=\"ck-squint\">\n                    <path d=\"M21.5,25.2 Q24.5,22.2 27.5,25.2\" fill=\"none\" stroke=\"#451A03\" stroke-width=\"1.4\" stroke-linecap=\"round\"/>\n                    <path d=\"M32.5,25.2 Q35.5,22.2 38.5,25.2\" fill=\"none\" stroke=\"#451A03\" stroke-width=\"1.4\" stroke-linecap=\"round\"/>\n                  </g>\n                  <g id=\"ck-jaw\">\n                    <path d=\"M27.5,29.5 Q30,31.6 32.5,29.5\" fill=\"none\" stroke=\"#451A03\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n                  </g>\n                  <ellipse cx=\"21.8\" cy=\"28.2\" rx=\"1.7\" ry=\"1.1\" fill=\"#F9A8D4\" opacity=\".55\"/>\n                  <ellipse cx=\"38.2\" cy=\"28.2\" rx=\"1.7\" ry=\"1.1\" fill=\"#F9A8D4\" opacity=\".55\"/>\n                </g>\n\n                <!-- nibble crumbs: drop from the mouth toward the rim -->\n                <g id=\"ck-crumbFX\">\n                  <circle class=\"cf\" cx=\"29\" cy=\"32\" r=\".8\" fill=\"#FBBF24\" style=\"--fx:-3px\"/>\n                  <circle class=\"cf\" cx=\"31.5\" cy=\"32.5\" r=\".65\" fill=\"#D97706\" style=\"--fx:2px\"/>\n                  <rect class=\"cf\" x=\"30\" y=\"31.5\" width=\"1.2\" height=\"1.2\" fill=\"#F59E0B\" style=\"--fx:4px\"/>\n                </g>\n\n                <!-- pop burst: steam puffs + crumb confetti (duck signature) -->\n                <g id=\"ck-burstFX\">\n                  <circle class=\"bp\" cx=\"26\" cy=\"9\" r=\"2.2\" fill=\"#F8FAFC\" style=\"--px:-7px;--py:-12px\"/>\n                  <circle class=\"bp\" cx=\"34\" cy=\"8.5\" r=\"2.5\" fill=\"#F1F5F9\" style=\"--px:7px;--py:-13px\"/>\n                  <circle class=\"bp\" cx=\"30\" cy=\"7\" r=\"2\" fill=\"#F8FAFC\" style=\"--px:0px;--py:-16px\"/>\n                  <circle class=\"crumb\" cx=\"30\" cy=\"10\" r=\"1.1\" fill=\"#FBBF24\" style=\"--cx:-13px;--cy:-16px;--cr:140deg\"/>\n                  <rect class=\"crumb\" x=\"28.5\" y=\"8.5\" width=\"2.2\" height=\"2.2\" fill=\"#D97706\" style=\"--cx:10px;--cy:-19px;--cr:200deg\"/>\n                  <circle class=\"crumb\" cx=\"32\" cy=\"9\" r=\".9\" fill=\"#F59E0B\" style=\"--cx:16px;--cy:-11px;--cr:90deg\"/>\n                  <rect class=\"crumb\" x=\"29\" y=\"9.5\" width=\"1.8\" height=\"1.8\" fill=\"#FDE68A\" style=\"--cx:-16px;--cy:-8px;--cr:-160deg\"/>\n                  <circle class=\"crumb\" cx=\"31\" cy=\"8\" r=\".8\" fill=\"#B45309\" style=\"--cx:-5px;--cy:-20px;--cr:60deg\"/>\n                  <rect class=\"crumb\" x=\"30.5\" y=\"8\" width=\"1.6\" height=\"1.6\" fill=\"#FBBF24\" style=\"--cx:18px;--cy:-17px;--cr:240deg\"/>\n                </g>\n\n                <!-- season shake: sesame + chili flecks fly off -->\n                <g id=\"ck-spiceFX\">\n                  <circle class=\"spk\" cx=\"22\" cy=\"16\" r=\".8\" fill=\"#FFFBEB\" style=\"--cx:-14px;--cy:-9px;--cr:120deg\"/>\n                  <rect class=\"spk\" x=\"36\" y=\"13\" width=\"1.6\" height=\"1.6\" fill=\"#DC2626\" style=\"--cx:13px;--cy:-11px;--cr:220deg\"/>\n                  <circle class=\"spk\" cx=\"30\" cy=\"11\" r=\".7\" fill=\"#FDE68A\" style=\"--cx:2px;--cy:-15px;--cr:80deg\"/>\n                  <ellipse class=\"spk\" cx=\"25\" cy=\"13\" rx=\"1\" ry=\".5\" fill=\"#FFFBEB\" style=\"--cx:-11px;--cy:-14px;--cr:-140deg\"/>\n                  <rect class=\"spk\" x=\"33\" y=\"17\" width=\"1.4\" height=\"1.4\" fill=\"#B45309\" style=\"--cx:15px;--cy:-4px;--cr:160deg\"/>\n                  <ellipse class=\"spk\" cx=\"35\" cy=\"10.5\" rx=\".9\" ry=\".5\" fill=\"#FFFBEB\" style=\"--cx:9px;--cy:-16px;--cr:200deg\"/>\n                </g>\n              </g>\n            </g>\n\n            <!-- pouch front panel: candy stripes, folded rim, stickers -->\n            <g id=\"ck-pouch\">\n              <path d=\"M13,33 L47,33 L44,55 Q43.7,57.5 41.2,57.5 L18.8,57.5 Q16.3,57.5 16,55 Z\"\n                    fill=\"#FEF2F2\" stroke=\"#9F1239\" stroke-width=\"1.5\" stroke-linejoin=\"round\"/>\n              <g clip-path=\"url(#ck-cpPouch)\">\n                <rect x=\"17\" y=\"33\" width=\"3.4\" height=\"25\" fill=\"#EF4444\" opacity=\".85\"/>\n                <rect x=\"24\" y=\"33\" width=\"3.4\" height=\"25\" fill=\"#EF4444\" opacity=\".85\"/>\n                <rect x=\"31\" y=\"33\" width=\"3.4\" height=\"25\" fill=\"#EF4444\" opacity=\".85\"/>\n                <rect x=\"38\" y=\"33\" width=\"3.4\" height=\"25\" fill=\"#EF4444\" opacity=\".85\"/>\n              </g>\n              <!-- folded rim -->\n              <path d=\"M13,33 L47,33 L46.5,36.8 L13.5,36.8 Z\" fill=\"#FEE2E2\" stroke=\"#9F1239\" stroke-width=\"1\" stroke-linejoin=\"round\"/>\n              <line x1=\"15\" y1=\"35\" x2=\"45.5\" y2=\"35\" stroke=\"#FCA5A5\" stroke-width=\".6\"/>\n              <!-- crinkle creases -->\n              <path d=\"M20,41 L21.5,44.5\" stroke=\"#FCA5A5\" stroke-width=\".7\" stroke-linecap=\"round\" fill=\"none\"/>\n              <path d=\"M42,44 L40.8,47.5\" stroke=\"#FCA5A5\" stroke-width=\".7\" stroke-linecap=\"round\" fill=\"none\"/>\n\n              <!-- airport-tag sticker: hidden until the trip is live -->\n              <g id=\"ck-tourTag\"><g transform=\"rotate(-8 22 45)\">\n                <rect x=\"18\" y=\"42.5\" width=\"8\" height=\"5\" rx=\"1\" fill=\"#BAE6FD\" stroke=\"#0369A1\" stroke-width=\".7\"/>\n                <line x1=\"19.4\" y1=\"43.6\" x2=\"19.4\" y2=\"46.4\" stroke=\"#0369A1\" stroke-width=\".5\"/>\n                <line x1=\"20.6\" y1=\"43.6\" x2=\"20.6\" y2=\"46.4\" stroke=\"#0369A1\" stroke-width=\".9\"/>\n                <line x1=\"22\" y1=\"43.6\" x2=\"22\" y2=\"46.4\" stroke=\"#0369A1\" stroke-width=\".5\"/>\n                <line x1=\"23.2\" y1=\"43.6\" x2=\"23.2\" y2=\"46.4\" stroke=\"#0369A1\" stroke-width=\".8\"/>\n                <circle cx=\"25\" cy=\"45\" r=\".8\" fill=\"none\" stroke=\"#0369A1\" stroke-width=\".5\"/>\n              </g></g>\n\n              <!-- price sticker; inner card does the split-flap -->\n              <g id=\"ck-price\">\n                <g id=\"ck-priceCard\">\n                  <g transform=\"rotate(7 39.6 46.8)\">\n                    <rect x=\"35.6\" y=\"43.4\" width=\"8\" height=\"6.8\" rx=\"1.2\" fill=\"#FDE68A\" stroke=\"#D97706\" stroke-width=\"1\"/>\n                    <g id=\"ck-priceLines\">\n                      <line x1=\"37\" y1=\"45.6\" x2=\"42.2\" y2=\"45.6\" stroke=\"#B45309\" stroke-width=\".8\" stroke-linecap=\"round\"/>\n                      <line x1=\"37\" y1=\"47.4\" x2=\"41\" y2=\"47.4\" stroke=\"#B45309\" stroke-width=\".8\" stroke-linecap=\"round\"/>\n                      <line x1=\"37\" y1=\"49\" x2=\"42.2\" y2=\"49\" stroke=\"#B45309\" stroke-width=\".8\" stroke-linecap=\"round\"/>\n                    </g>\n                    <text id=\"ck-priceNum\" x=\"39.6\" y=\"49.2\" text-anchor=\"middle\"\n                          font-family=\"'Trebuchet MS','Segoe UI',sans-serif\" font-size=\"5.8\" font-weight=\"700\"\n                          fill=\"#B45309\">7</text>\n                  </g>\n                </g>\n              </g>\n            </g>\n          </g>\n        </g>\n\n        <!-- ground dust puff (feet level, outside the airborne groups) -->\n        <g id=\"ck-puffG\">\n          <circle class=\"pg\" cx=\"24\" cy=\"63\" r=\"1.6\" fill=\"#E2E8F0\" style=\"--px:-8px;--py:-3px\"/>\n          <circle class=\"pg\" cx=\"36\" cy=\"63\" r=\"1.4\" fill=\"#F1F5F9\" style=\"--px:8px;--py:-4px\"/>\n          <circle class=\"pg\" cx=\"28\" cy=\"63.5\" r=\"1.1\" fill=\"#CBD5E1\" style=\"--px:-4px;--py:-6px\"/>\n          <circle class=\"pg\" cx=\"33\" cy=\"63.5\" r=\"1.2\" fill=\"#E2E8F0\" style=\"--px:5px;--py:-5px\"/>\n        </g>\n      </svg>";
+
+  var SHADOW = "<svg class=\"shadow\" id=\"ck-shadow\" width=\"60\" height=\"10\" viewBox=\"0 0 60 10\" aria-hidden=\"true\">\n    <ellipse cx=\"30\" cy=\"5\" rx=\"26\" ry=\"4\" fill=\"#000\"/>\n  </svg>";
+
+  var FX = "<div class=\"fx\" id=\"ck-fx\">\n    <span class=\"zz z1\">z</span>\n    <span class=\"zz z2\">z</span>\n    <span class=\"zz z3\">z</span>\n  </div>";
+
+  // pouch micro-motion + landing dust, shared by several states
+  function crinklePouch(k) { k.pulse('crinkle', 600); }
+  function puffGround(k) { k.pulse('puffG', 800); }
+
+  TrekMascots.register({
+    id: 'chiki',
+    name: 'Chiki',
+    tagline: 'the karaage — best before: right now',
+    width: 66,
+    height: 73,
+    css: CSS,
+    svg: SVG,
+    shadow: SHADOW,
+    fx: FX,
+    moods: ['lukewarm', 'warm', 'fresh', 'ontour'],
+    reducedPose: 'pose-sit',
+    signature: 'duck',
+    shineClasses: ['sh1', 'sh2'],
+    blinkEvery: [2400, 5800],
+    stateClasses: ['st-walk', 'st-idle', 'st-sit', 'st-sleep', 'st-stretch', 'st-wave', 'st-jump',
+      'st-duck', 'st-steam', 'st-nibble', 'st-wobble', 'st-season', 'st-priceflip', 'st-peek',
+      'pose-sit', 'look-down', 'look-up', 'look-l', 'look-r', 'eyes-closed', 'squint', 'hop',
+      'crinkle', 'psquash', 'duck-in', 'duck-peek', 'popout', 'burst', 'crumbs',
+      'munch', 'crumbfall', 'panic', 'spicefly', 'flipping', 'price-num', 'puffG'],
+    edgeStates: { peek: true },
+    afterState: { sleep: 'stretch', stretch: 'idle' },
+    glide: null,
+    config: {
+      turnPad: 20,
+      edgeSnap: 34,
+      speed: { lukewarm: 20, warm: 32, fresh: 54, ontour: 30 },
+      step:  { lukewarm: '0.8s', warm: '0.6s', fresh: '0.4s', ontour: '0.68s' },
+      waveEveryMs: 95000,
+      dur: {
+        walk: [2600, 7000], idle: [1500, 3400], sit: [3200, 7500], sleep: [6500, 12000],
+        stretch: [1750, 1750], wave: [2050, 2050], jump: [1050, 1050],
+        duck: [3050, 3050], steam: [2600, 2600], nibble: [3400, 3400],
+        wobble: [2850, 2850], season: [2450, 2450], priceflip: [3200, 3200],
+        peek: [2000, 3400]
+      },
+      weights: {
+        lukewarm: { walk: 4.5, idle: 4.5, sit: 3.4, duck: .9,  steam: 1.6, nibble: 1.6, wobble: .5, season: .25, wave: .6,  jump: .35, peek: 1.1, priceflip: 0 },
+        warm:     { walk: 6,   idle: 3,   sit: 1.8, duck: 1.4, steam: 1.6, nibble: 1.4, wobble: .7, season: .6,  wave: 1,   jump: 1.4, peek: 1.2, priceflip: 0 },
+        fresh:    { walk: 7,   idle: 1.5, sit: .4,  duck: 2.6, steam: 2,   nibble: 1,   wobble: .8, season: 1.6, wave: 1.8, jump: 3,   peek: 1.1, priceflip: 1.2 },
+        ontour:   { walk: 5,   idle: 3,   sit: 2.2, duck: 1.4, steam: 2.2, nibble: 1.6, wobble: .6, season: .8,  wave: 1.2, jump: 1.2, peek: 1,   priceflip: 0 }
+      },
+      sleepFromSit: { lukewarm: 3, warm: 1.2, fresh: 0, ontour: 1 }
+    },
+
+    onTurn: function (k) { crinklePouch(k); },   // paper protests every turn-around
+    filterWeights: function (k, w) {
+      if (!(k.mood === 'fresh' && k.tripDays != null)) delete w.priceflip; // the flip needs a real countdown
+    },
+    moodFromTrip: function (days, ongoing) {
+      if (ongoing === true) return 'ontour';
+      if (days !== null && days >= 0 && days <= 7) return 'fresh';
+      if (days !== null && days > 7 && days <= 14) return 'warm';
+      return 'lukewarm';
+    },
+    onMood: function (k, m, changed) {
+      if (m === 'ontour') {
+        if (!k._tourOn) {
+          k._tourOn = true;
+          setTimeout(function () { if (k._tourOn) k.addC('tour-on'); }, 700);
+        }
+      } else if (k._tourOn) {
+        k._tourOn = false;
+        k.remC('tour-on');
+      }
+      if (changed && m === 'fresh' && !TrekMascots.reduced && (k.state === 'sleep' || k.state === 'sit')) {
+        k.setState(k.state === 'sleep' ? 'stretch' : 'jump');
+      }
+    },
+    // occasional crinkle outside the FSM so even long sits feel papery
+    ambient: function (k) {
+      (function crinkleLoop() {
+        setTimeout(function () {
+          if (k.dead) return;
+          if (k.state !== 'sleep' && Math.random() < .7) crinklePouch(k);
+          crinkleLoop();
+        }, k.rand(14000, 30000));
+      })();
+    },
+
+    enter: {
+      walk: function (k) { if (Math.random() < .3) k.setDir(-k.dir); },
+      idle: function (k) {
+        if (Math.random() < .8) k.later(function () {
+          k.addC(Math.random() < .5 ? 'look-l' : 'look-r');
+          k.later(function () { k.remC('look-l'); k.remC('look-r'); }, k.rand(500, 900));
+        }, k.rand(300, 1200));
+        if (Math.random() < .5) k.later(function () { crinklePouch(k); }, k.rand(600, 1800));
+        if (k.mood === 'fresh' && Math.random() < .3) k.later(function () {
+          k.addC('look-up');                              // watching its own steam
+          k.later(function () { k.remC('look-up'); }, 700);
+        }, k.rand(1400, 2200));
+        if (k.mood === 'ontour' && Math.random() < .35) k.later(function () {
+          k.addC('squint');                               // content on the road
+          k.later(function () { k.remC('squint'); }, 800);
+        }, k.rand(800, 1600));
+      },
+      sit: function (k) {
+        k.addC('pose-sit');
+        if (Math.random() < .6) k.later(function () { crinklePouch(k); }, k.rand(1000, 3000));
+      },
+      sleep: function (k) { k.addC('pose-sit'); },
+      stretch: function (k) { k.addC('eyes-closed'); k.later(function () { k.remC('eyes-closed'); }, 650); },
+      wave: function (k) {
+        k.lastWave = performance.now();
+        k.later(function () { k.addC('squint'); }, 450);
+        k.later(function () { k.remC('squint'); }, 1550);
+        if (k.mood === 'fresh') {
+          k.later(function () { k.addC('hop'); }, 1400);
+          k.later(function () { k.remC('hop'); }, 1850);
+        }
+      },
+      jump: function (k) {
+        k.later(function () { k.addC('squint'); }, 300);
+        k.later(function () { k.remC('squint'); }, 700);
+        k.later(function () { puffGround(k); }, 770);      // dust on landing
+        if (k.mood === 'fresh') {
+          k.later(function () { k.pulse('crumbs', 900); }, 640); // crumbs shake loose on the way down
+        }
+      },
+      peek: function (k) {
+        k.setDir(k.x - k.minX < k.maxX - k.x ? -1 : 1);
+        k.later(function () { k.addC('look-down'); }, 380);
+      },
+      // signature move: drop into the pouch, peek over the rim, pop back out
+      duck: function (k) {
+        k.pulse('psquash', 550);
+        k.later(function () { k.addC('duck-in'); }, 140);
+        k.later(function () { k.addC('look-up'); }, 700);
+        k.later(function () { k.remC('duck-in'); k.addC('duck-peek'); }, 950);   // eyes over the rim
+        k.later(function () {                                                    // suspense over: pop
+          k.remC('duck-peek'); k.remC('look-up');
+          k.pulse('popout', 650);
+        }, 1950);
+        k.later(function () { k.pulse('burst', 950); }, 2000); // steam burst + crumb confetti
+        k.later(function () { k.addC('squint'); }, 2150);
+        k.later(function () { k.addC('hop'); }, 2300);
+        k.later(function () { k.remC('hop'); }, 2750);
+        k.later(function () { k.remC('squint'); }, 2950);
+      },
+      // self-warming: CSS opens the plume, we just add the smug face
+      steam: function (k) {
+        k.later(function () { k.addC('look-up'); }, 100);
+        k.later(function () { k.remC('look-up'); k.addC('squint'); }, 350);
+        k.later(function () { k.remC('squint'); }, 2350);
+      },
+      // lean to the rim, munch a crumb off the fold, drop the evidence
+      nibble: function (k) {
+        k.later(function () { k.addC('look-down'); }, 250);
+        k.later(function () { k.addC('munch'); }, 700);
+        k.later(function () { k.pulse('crumbfall', 750); }, 900);
+        k.later(function () { k.pulse('crumbfall', 750); }, 1650);
+        k.later(function () { k.remC('munch'); }, 2450);
+        k.later(function () { k.remC('look-down'); k.addC('squint'); }, 2600);
+      },
+      // paper physics fail: tip past balance, flail, recover with a hop
+      wobble: function (k) {
+        k.later(function () { k.addC('panic'); }, 500);
+        k.later(function () { k.remC('panic'); }, 1950);
+        k.later(function () { k.addC('hop'); }, 2150);
+        k.later(function () { puffGround(k); }, 2250);
+        k.later(function () { k.remC('hop'); }, 2650);
+      },
+      // wet-dog shake: spice flies, then stand there proud of it
+      season: function (k) {
+        k.later(function () { k.pulse('spicefly', 1000); }, 500);
+        k.later(function () { k.addC('squint'); }, 1750);
+        k.later(function () { k.addC('hop'); }, 1950);
+        k.later(function () { k.remC('hop'); }, 2400);
+      },
+      // konbini split-flap: the price sticker flips to days-until-trip (fresh only)
+      priceflip: function (k) {
+        var d = TrekMascots.clamp(Math.round(k.tripDays == null ? 0 : k.tripDays), 0, 99);
+        k.later(function () { k.addC('look-down'); }, 200);
+        k.later(function () { k.addC('flipping'); }, 350);
+        k.later(function () {                            // swap content mid-flap
+          var num = k.el.querySelector('#ck-priceNum');
+          if (num) num.textContent = String(d);
+          k.addC('price-num');
+        }, 760);
+        k.later(function () { k.remC('flipping'); }, 1250);
+        k.later(function () { k.addC('squint'); }, 1500);
+        k.later(function () { k.addC('hop'); }, 1600);
+        k.later(function () { k.remC('hop'); k.remC('squint'); }, 2150);
+        k.later(function () { k.remC('look-down'); }, 2600);
+      }
+    }
+  });
+})();
+</script>
+<!-- characters/passi.js -->
+<script>
+// Passi -- a little burgundy passport booklet: golden globe emblem on the
+// cover, fanned page edges along the open side, a silky bookmark ribbon for a
+// tail and an inner page that collects visa stamps. Nimble and a bit vain
+// about his photo. Runs on the shared mascot engine.
+(function () {
+  'use strict';
+
+  var CSS = '' +
+  '\n  /* ---- moving root: JS drives translate3d(x) ---- */\n' +
+  '#m-passi .jumper, #m-passi .flip { position: absolute; inset: 0; }\n' +
+  '#m-passi .jumper { transform-origin: 50% 100%; }\n' +
+  '#m-passi .flip { transition: transform .24s ease; transform-origin: 50% 50%; }\n' +
+  '#m-passi .char {\n' +
+  '    display: block;\n' +
+  '    position: absolute;\n' +
+  '    left: 0;\n' +
+  '    bottom: 0;\n' +
+  '    overflow: visible;\n' +
+  '    /* rim: dark shadow + faint light halo so Passi reads on any hero image */\n' +
+  '    filter: drop-shadow(0 1px 1px rgba(2,6,23,.35)) drop-shadow(0 0 1px rgba(248,250,252,.3));\n' +
+  '  }\n' +
+  '\n  /* ---- ground shadow ---- */\n' +
+  '#m-passi .shadow {\n' +
+  '    position: absolute;\n' +
+  '    left: 50%;\n' +
+  '    bottom: 0;\n' +
+  '    margin-left: -28px;\n' +
+  '    opacity: .17;\n' +
+  '    filter: blur(1.1px);\n' +
+  '    transform-origin: 50% 100%;\n' +
+  '    transition: transform .4s ease, opacity .4s ease;\n' +
+  '  }\n' +
+  '#m-passi.pose-sit .shadow { transform: scaleX(1.12); opacity: .21; }\n' +
+  '#m-passi.st-sleep .shadow { transform: scaleX(1.55); opacity: .2; }\n' +
+  '#m-passi.glide-out .shadow { transform: scaleX(1.28); opacity: .12; }\n' +
+  '\n  /* ---- SVG group plumbing: CSS transforms in viewBox units ---- */\n' +
+  '  #pp-root, #pp-trunk, #pp-breathe, #pp-face, #pp-legL, #pp-legR, #pp-coverF, #pp-wingB, #pp-fan, #pp-ribbon, #pp-lids, #pp-corner, #pp-pg1, #pp-pg2, #pp-pg3, #pp-pg4, #pp-stampRig, #pp-stampAnim, #pp-puffV, #pp-scan, #pp-squint, #pp-visaNumW { transform-box: view-box; }\n' +
+  '\n' +
+  '#pp-root { transform-origin: 26px 62px; transition: transform .5s cubic-bezier(.4,0,.3,1); }\n' +
+  '#pp-trunk { transform-origin: 26px 52px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n' +
+  '#pp-breathe { transform-origin: 26px 48px; animation: ppBreathe 3.2s ease-in-out infinite; }\n' +
+  '#pp-legL { transform-origin: 19.6px 47px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n' +
+  '#pp-legR { transform-origin: 32.4px 47px; transition: transform .45s cubic-bezier(.34,1.4,.64,1); }\n' +
+  '  /* front cover hinges at the spine; closing is snappier than opening */\n' +
+  '#pp-coverF { transform-origin: 12.9px 28px; transition: transform .17s cubic-bezier(.5,-.28,.7,1); }\n' +
+  '#pp-wingB { transform-origin: 12.2px 28px; transform: scaleX(.04); transition: transform .17s cubic-bezier(.5,-.28,.7,1); }\n' +
+  '#pp-fan { transform-origin: 13px 28px; }\n' +
+  '#pp-ribbon { transform-origin: 16px 7.4px; animation: ppRibbonIdle 3.6s ease-in-out infinite; transition: transform 1s ease; }\n' +
+  '#pp-lids { transform-origin: 24.7px 15.7px; transform: scaleY(0); transition: transform .09s ease-out; }\n' +
+  '#pp-pupils { transform-box: fill-box; transform-origin: center; transition: transform .3s ease, opacity .12s ease; animation: ppDrift 8s ease-in-out infinite; }\n' +
+  '#pp-corner { transform-origin: 39.2px 9.6px; animation: ppCorner 6s ease-in-out infinite; }\n' +
+  '#m-passi.mood-soon #pp-corner { animation-duration: 2.8s; }\n' +
+  '#m-passi.mood-hype #pp-corner { animation-duration: 3.6s; }\n' +
+  '#pp-pg1, #pp-pg2, #pp-pg3, #pp-pg4 { transform-origin: 13.5px 28px; }\n' +
+  '#m-passi .rif { opacity: 0; }\n' +
+  '\n  /* stamp rig + impact puff + day number all steer to a slot via --sx/--sy */\n' +
+  '#pp-stampAnim { opacity: 0; transform-origin: 25px 28px; }\n' +
+  '#pp-stampRig, #pp-puffV, #pp-visaNumW { transform: translate(var(--sx, 0px), var(--sy, 0px)); }\n' +
+  '#pp-visaNum { opacity: 0; transform-box: fill-box; transform-origin: center; transition: opacity .18s ease; }\n' +
+  '#m-passi.flipped #pp-visaNum { transform: scaleX(-1); } /* counter-flip: glyphs never mirror */\n' +
+  '#m-passi.visa-num #pp-visaNum { opacity: 1; }\n' +
+  '\n  /* earned visa stamps: hidden until stamped, then persist for the session */\n' +
+  '#m-passi .visa { opacity: 0; transform: scale(.2); transform-box: fill-box; transform-origin: center;\n' +
+  '         transition: transform .5s cubic-bezier(.3,1.5,.5,1), opacity .25s ease; }\n' +
+  '#m-passi.visa-on-1 #pp-visa1, #m-passi.visa-on-2 #pp-visa2, #m-passi.visa-on-3 #pp-visa3, #m-passi.visa-on-4 #pp-visa4 { opacity: .96; transform: scale(1); }\n' +
+  '#m-passi.visa-b1 #pp-visa1, #m-passi.visa-b2 #pp-visa2, #m-passi.visa-b3 #pp-visa3, #m-passi.visa-b4 #pp-visa4 { animation: ppVisaPop .65s ease-in-out; }\n' +
+  '\n  /* ARRIVED corner stamp: slams in once the trip is live */\n' +
+  '#pp-arrived { transform-box: fill-box; transform-origin: center; transform: rotate(-16deg) scale(2.3); opacity: 0;\n' +
+  '         transition: transform .55s cubic-bezier(.2,1.6,.4,1), opacity .3s ease; }\n' +
+  '#m-passi.arrived-on #pp-arrived { transform: rotate(-16deg) scale(1); opacity: .95; }\n' +
+  '\n' +
+  '#pp-squint { opacity: 0; transition: opacity .12s ease; }\n' +
+  '#m-passi .blush { transition: opacity .3s ease; }\n' +
+  '#m-passi .streak, #m-passi .pd, #m-passi .pg, #m-passi .pv { opacity: 0; }\n' +
+  '#m-passi .pd, #m-passi .pg, #m-passi .pv { transform-box: fill-box; transform-origin: center; }\n' +
+  '#m-passi .streak { transform-box: view-box; }\n' +
+  '#pp-scan { transform: translateY(-8px); }\n' +
+  '\n  /* ---- eyes ---- */\n' +
+  '#m-passi.blink #pp-lids, #m-passi.st-sleep #pp-lids, #m-passi.eyes-closed #pp-lids { transform: scaleY(1); }\n' +
+  '#m-passi.look-down #pp-pupils { animation: none; transform: translate(.8px, 1.9px); }\n' +
+  '#m-passi.look-up   #pp-pupils { animation: none; transform: translate(.5px, -2px); }\n' +
+  '#m-passi.look-l    #pp-pupils { animation: none; transform: translate(-1.4px, .2px); }\n' +
+  '#m-passi.look-r    #pp-pupils { animation: none; transform: translate(1.4px, .2px); }\n' +
+  '#m-passi.squint #pp-pupils { opacity: 0; }\n' +
+  '#m-passi.squint #pp-squint { opacity: 1; }\n' +
+  '#m-passi.rigid #pp-pupils { animation: none; transform: scale(.82); } /* eyes wide, dead ahead */\n' +
+  '#m-passi.dizzy #pp-pupils { animation: ppDizzy .95s ease-in-out; }\n' +
+  '#m-passi.dizzy .blush { opacity: .95; }\n' +
+  '\n  /* ---- ribbon twitch (idle micro-motion) ---- */\n' +
+  '#m-passi.twitch #pp-ribbon { animation: ppRibbonTwitch .55s ease-in-out; }\n' +
+  '\n  /* ---- walk cycle: bouncy waddle, cover chatters, pages jig ---- */\n' +
+  '#m-passi.st-walk #pp-legL { animation: ppStep var(--step) ease-in-out infinite; }\n' +
+  '#m-passi.st-walk #pp-legR { animation: ppStep var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -2); }\n' +
+  '#m-passi.st-walk #pp-trunk { animation: ppBob calc(var(--step) / 2) ease-in-out infinite; }\n' +
+  '#m-passi.st-walk #pp-face { animation: ppCounter calc(var(--step) / 2) ease-in-out infinite; animation-delay: calc(var(--step) / -10); }\n' +
+  '#m-passi.st-walk #pp-ribbon { animation: ppRibbonWalk var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -7); }\n' +
+  '#m-passi.st-walk #pp-coverF { animation: ppCoverChatter var(--step) ease-in-out infinite; }\n' +
+  '#m-passi.st-walk #pp-fan { animation: ppFanJig calc(var(--step) / 2) ease-in-out infinite; }\n' +
+  '\n  /* ribbon flutter on turn-around (after walk rules so it wins for its .6s) */\n' +
+  '#m-passi.flutter #pp-ribbon { animation: ppRibbonFlutter .6s ease-in-out; }\n' +
+  '\n  /* ---- paper rustle one-shot (ambient + landings) ---- */\n' +
+  '#m-passi.flare #pp-fan { animation: ppFanFlare .6s ease-in-out; }\n' +
+  '#m-passi.flare #pp-corner { animation: ppCornerLift .6s ease-in-out; }\n' +
+  '';
+
+  CSS += '' +
+  '\n  /* ---- sit / sleep ---- */\n' +
+  '#m-passi.pose-sit #pp-trunk { transform: translateY(9px); }\n' +
+  '#m-passi.pose-sit #pp-legL { transform: translate(14px, 9px) rotate(84deg); }\n' +
+  '#m-passi.pose-sit #pp-legR { transform: translate(11px, 9px) rotate(72deg); }\n' +
+  '  /* sleep: keels over and lies flat closed, feet poking out, ribbon as blanket */\n' +
+  '#m-passi.st-sleep #pp-trunk { transform-origin: 26px 49px; transform: rotate(-78deg) translateY(1px);\n' +
+  '         transition: transform .9s cubic-bezier(.5,0,.4,1); }\n' +
+  '#m-passi.st-sleep #pp-legL { transform: translate(1px, 5px) rotate(84deg); }\n' +
+  '#m-passi.st-sleep #pp-legR { transform: translate(-1px, 6px) rotate(88deg); }\n' +
+  '#m-passi.st-sleep #pp-ribbon { animation: none; transform: rotate(-62deg) translate(.6px, .4px);\n' +
+  '         transition: transform 1.4s ease .5s; }\n' +
+  '#m-passi.st-sleep #pp-breathe { animation-name: ppBreatheDeep; animation-duration: 4.6s; }\n' +
+  '\n  /* ---- fx overlays (outside the flip wrapper: glyphs never mirror) ---- */\n' +
+  '#m-passi .fx { position: absolute; inset: 0; pointer-events: none; }\n' +
+  '#m-passi .zz {\n' +
+  '    position: absolute; top: 20px; opacity: 0;\n' +
+  '    font: italic 700 12px/1 Georgia, serif;\n' +
+  '    color: #FFF1F2;\n' +
+  '    text-shadow: 0 1px 2px rgba(76,5,25,.75);\n' +
+  '  }\n' +
+  '#m-passi .z1 { left: 10px; } #m-passi .z2 { left: 3px; } #m-passi .z3 { left: 17px; }\n' +
+  '#m-passi.st-sleep .z1 { animation: ppZ 2.7s ease-in-out infinite; }\n' +
+  '#m-passi.st-sleep .z2 { animation: ppZ 2.7s ease-in-out .9s infinite; }\n' +
+  '#m-passi.st-sleep .z3 { animation: ppZ 2.7s ease-in-out 1.8s infinite; }\n' +
+  '  /* relieved sweat drop after inspection */\n' +
+  '#m-passi .drop { position: absolute; left: 41px; top: 16px; width: 5px; height: 7px; opacity: 0;\n' +
+  '    background: #BAE6FD; border: 1px solid #38BDF8;\n' +
+  '    border-radius: 50% 50% 50% 50% / 62% 62% 38% 38%; }\n' +
+  '#m-passi.sweat .drop { animation: ppSweat 1.05s ease-out; }\n' +
+  '\n  /* ---- state one-shots ---- */\n' +
+  '#m-passi.st-wave #pp-ribbon { animation: ppRibbonWave 1.9s ease-in-out; } /* no arms; the ribbon waves */\n' +
+  '#m-passi.st-wave #pp-root { animation: ppWaveLean 1.9s ease-in-out; }\n' +
+  '\n' +
+  '#m-passi.st-jump .jumper { animation: ppJump 1s cubic-bezier(.4,0,.4,1); }\n' +
+  '#m-passi.st-jump .shadow { animation: ppShadowJump 1s cubic-bezier(.4,0,.4,1); }\n' +
+  '\n' +
+  '#m-passi.hop .jumper { animation: ppHop .45s ease-in-out; }\n' +
+  '#m-passi.hop .shadow { animation: ppShadowHop .45s ease-in-out; }\n' +
+  '\n' +
+  '#m-passi.st-peek #pp-root { transform: rotate(9deg) translateX(1.5px); }\n' +
+  '\n' +
+  '#m-passi.st-stretch #pp-root { animation: ppStretch 1.7s ease-in-out; }\n' +
+  '#m-passi.st-stretch #pp-coverF { animation: ppCoverYawn 1.7s ease-in-out; }\n' +
+  '\n  /* cover swings open at the spine (scaleX fakes the hinge at this size) */\n' +
+  '#m-passi.cover-open #pp-coverF { transform: scaleX(.07); transition: transform .32s cubic-bezier(.3,1.25,.5,1); }\n' +
+  '#m-passi.snap #pp-trunk { animation: ppSnap .5s ease-out; }\n' +
+  '\n  /* ---- riffle: staggered page fan while the cover is open ---- */\n' +
+  '#m-passi.riffling .rif { opacity: 1; }\n' +
+  '#m-passi.riffling #pp-pg1 { animation: ppRiffle .46s cubic-bezier(.5,0,.6,1) 2; }\n' +
+  '#m-passi.riffling #pp-pg2 { animation: ppRiffle .46s cubic-bezier(.5,0,.6,1) .1s 2; }\n' +
+  '#m-passi.riffling #pp-pg3 { animation: ppRiffle .46s cubic-bezier(.5,0,.6,1) .2s 2; }\n' +
+  '#m-passi.riffling #pp-pg4 { animation: ppRiffle .46s cubic-bezier(.5,0,.6,1) .3s 2; }\n' +
+  '#m-passi.dusty .pd { animation: ppPuff .7s ease-out; }\n' +
+  '#m-passi.dusty .pd:nth-child(2n) { animation-duration: .85s; }\n' +
+  '#m-passi.puffG .pg { animation: ppPuff .6s ease-out; }\n' +
+  '#m-passi.puffV .pv { animation: ppPuff .55s ease-out; }\n' +
+  '\n  /* ---- visa stamping ---- */\n' +
+  '#m-passi.stamping #pp-stampAnim { animation: ppStamp 2.4s ease-in-out; }\n' +
+  '#m-passi.stamp-hit #pp-trunk { animation: ppStampHit .5s ease-out; }\n' +
+  '\n  /* ---- gaze: reading his own visas, page corner lifts ---- */\n' +
+  '#m-passi.st-gaze #pp-corner { animation: ppCornerLift 2.2s ease-in-out infinite; }\n' +
+  '#m-passi.sigh #pp-trunk { animation: ppSigh .7s ease-in-out; }\n' +
+  '\n  /* ---- ribbon chase: quick spins, ribbon streams, ends dizzy ---- */\n' +
+  '#m-passi.st-ribbonchase .jumper { animation: ppChase 1.9s cubic-bezier(.45,.05,.55,.95); }\n' +
+  '#m-passi.st-ribbonchase .shadow { animation: ppShadowChase 1.9s ease-in-out; }\n' +
+  '#m-passi.st-ribbonchase #pp-ribbon { animation: ppRibbonStream 1.9s ease-in-out; }\n' +
+  '\n  /* ---- inspection: rigid pose, held breath, scan beam, relieved slump ---- */\n' +
+  '#m-passi.rigid #pp-root { transform: scale(1.015, 1.05); }\n' +
+  '#m-passi.rigid #pp-breathe { animation-play-state: paused; }\n' +
+  '#m-passi.rigid #pp-ribbon { animation: none; }\n' +
+  '#m-passi.scanning #pp-scan { animation: ppScan 1.8s ease-in-out; }\n' +
+  '#m-passi.phew #pp-trunk { transform: rotate(2.5deg) translateY(1.6px); }\n' +
+  '\n  /* ---- glide: covers half-open as wings, lean in and sail the strip ---- */\n' +
+  '#m-passi.glide-out #pp-root { transform: rotate(12deg); }\n' +
+  '#m-passi.glide-out #pp-coverF { transform: scaleX(.46); transition: transform .3s cubic-bezier(.34,1.4,.64,1); }\n' +
+  '#m-passi.glide-out #pp-wingB { transform: scaleX(-.5); transition: transform .3s cubic-bezier(.34,1.4,.64,1) .05s; }\n' +
+  '#m-passi.glide-out #pp-legL { transform: translate(1px, -7px) rotate(52deg); }\n' +
+  '#m-passi.glide-out #pp-legR { transform: translate(0, -3px) rotate(44deg); }\n' +
+  '#m-passi.gliding #pp-root { animation: ppGlideBob 1.1s ease-in-out infinite; }\n' +
+  '#m-passi.gliding #pp-coverF { animation: ppWingF .6s ease-in-out infinite; }\n' +
+  '#m-passi.gliding #pp-wingB { animation: ppWingB .6s ease-in-out infinite; }\n' +
+  '\n  /* ---- specular shine sweeps (gold emblem + gilded page edges) ---- */\n' +
+  '#m-passi.sh1 #pp-shineEm { animation: ppShine .95s ease-in-out; }\n' +
+  '#m-passi.sh2 #pp-shineFan { animation: ppShine .85s ease-in-out; }\n' +
+  '';
+
+  CSS += '' +
+  '\n  /* ---- keyframes ---- */\n' +
+  '  @keyframes ppStep    { 0%,100% { transform: rotate(22deg); } 50% { transform: rotate(-22deg); } }\n' +
+  '  @keyframes ppBob     { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-1.6px); } }\n' +
+  '  @keyframes ppCounter { 0%,100% { transform: translateY(0); } 50% { transform: translateY(.9px); } }\n' +
+  '  @keyframes ppRibbonIdle { 0%,100% { transform: rotate(-3deg); } 50% { transform: rotate(3.5deg); } }\n' +
+  '  @keyframes ppRibbonWalk { 0%,100% { transform: rotate(12deg); } 50% { transform: rotate(-14deg); } }\n' +
+  '  @keyframes ppRibbonTwitch { 0%,100% { transform: rotate(0); } 25% { transform: rotate(11deg); } 55% { transform: rotate(-8deg); } 80% { transform: rotate(4deg); } }\n' +
+  '  @keyframes ppRibbonFlutter { 0%,100% { transform: rotate(0); } 20% { transform: rotate(16deg); } 45% { transform: rotate(-12deg); } 70% { transform: rotate(8deg); } 88% { transform: rotate(-3deg); } }\n' +
+  '  @keyframes ppRibbonWave {\n' +
+  '    0%,100% { transform: rotate(0); }\n' +
+  '    16% { transform: rotate(-148deg); }\n' +
+  '    32% { transform: rotate(-118deg); }\n' +
+  '    48% { transform: rotate(-152deg); }\n' +
+  '    64% { transform: rotate(-122deg); }\n' +
+  '    80% { transform: rotate(-148deg); }\n' +
+  '  }\n' +
+  '  @keyframes ppRibbonStream {\n' +
+  '    0%,100% { transform: rotate(0); }\n' +
+  '    15% { transform: rotate(-64deg); }\n' +
+  '    40% { transform: rotate(-84deg); }\n' +
+  '    70% { transform: rotate(-70deg); }\n' +
+  '    90% { transform: rotate(-18deg); }\n' +
+  '  }\n' +
+  '  @keyframes ppWaveLean { 0%,100% { transform: rotate(0); } 18%,78% { transform: rotate(-4deg); } }\n' +
+  '  @keyframes ppBreathe     { 0%,100% { transform: scale(1); } 50% { transform: scale(1.009, 1.024); } }\n' +
+  '  @keyframes ppBreatheDeep { 0%,100% { transform: scale(1); } 50% { transform: scale(1.02, 1.045); } }\n' +
+  '  @keyframes ppDrift {\n' +
+  '    0%,100% { transform: translate(0,0); }\n' +
+  '    24%     { transform: translate(.7px,.3px); }\n' +
+  '    52%     { transform: translate(-.6px,.5px); }\n' +
+  '    76%     { transform: translate(.3px,-.3px); }\n' +
+  '  }\n' +
+  '  @keyframes ppCorner     { 0%,100% { transform: rotate(0); } 50% { transform: rotate(-7deg); } }\n' +
+  '  @keyframes ppCornerLift { 0%,100% { transform: rotate(0); } 40% { transform: rotate(-24deg); } 60% { transform: rotate(-20deg); } }\n' +
+  '  @keyframes ppCoverChatter { 0%,100% { transform: scaleX(1); } 50% { transform: scaleX(.962); } }\n' +
+  '  @keyframes ppFanJig   { 0%,100% { transform: scaleX(1); } 50% { transform: scaleX(1.028); } }\n' +
+  '  @keyframes ppFanFlare { 0%,100% { transform: scaleX(1); } 25% { transform: scaleX(1.06); } 50% { transform: scaleX(.97); } 75% { transform: scaleX(1.03); } }\n' +
+  '  @keyframes ppZ {\n' +
+  '    0%   { opacity: 0; transform: translate(0, 6px) scale(.6); }\n' +
+  '    25%  { opacity: .9; }\n' +
+  '    100% { opacity: 0; transform: translate(10px, -24px) scale(1.3); }\n' +
+  '  }\n' +
+  '  @keyframes ppJump {\n' +
+  '    0%   { transform: translateY(0)     scale(1); }\n' +
+  '    16%  { transform: translateY(0)     scale(1.1, .82); }   /* anticipation squash */\n' +
+  '    28%  { transform: translateY(-12px) scale(.94, 1.1); }   /* launch stretch */\n' +
+  '    50%  { transform: translateY(-34px) scale(1, 1.03); }    /* lightest of the family */\n' +
+  '    72%  { transform: translateY(-3px)  scale(.98, 1.02); }\n' +
+  '    82%  { transform: translateY(0)     scale(1.14, .82); }  /* landing squash */\n' +
+  '    92%  { transform: translateY(0)     scale(.97, 1.03); }\n' +
+  '    100% { transform: translateY(0)     scale(1); }\n' +
+  '  }\n' +
+  '  @keyframes ppShadowJump {\n' +
+  '    0%   { transform: scale(1); opacity: .17; }\n' +
+  '    16%  { transform: scale(1.08, 1); opacity: .2; }\n' +
+  '    50%  { transform: scale(.5); opacity: .05; }\n' +
+  '    82%  { transform: scale(1.16, 1); opacity: .22; }\n' +
+  '    100% { transform: scale(1); opacity: .17; }\n' +
+  '  }\n' +
+  '  @keyframes ppHop {\n' +
+  '    0%   { transform: translateY(0)    scale(1); }\n' +
+  '    25%  { transform: translateY(0)    scale(1.06, .9); }\n' +
+  '    55%  { transform: translateY(-9px) scale(.98, 1.04); }\n' +
+  '    85%  { transform: translateY(0)    scale(1.05, .94); }\n' +
+  '    100% { transform: translateY(0)    scale(1); }\n' +
+  '  }\n' +
+  '  @keyframes ppShadowHop { 0%,100% { transform: scale(1); opacity: .17; } 55% { transform: scale(.85); opacity: .12; } }\n' +
+  '  @keyframes ppStretch {\n' +
+  '    0%   { transform: scale(1); }\n' +
+  '    30%  { transform: scale(.96, 1.07); }\n' +
+  '    62%  { transform: scale(.96, 1.075); }\n' +
+  '    82%  { transform: scale(1.04, .95); }\n' +
+  '    100% { transform: scale(1); }\n' +
+  '  }\n' +
+  '  @keyframes ppCoverYawn { 0%,100% { transform: scaleX(1); } 30%,65% { transform: scaleX(.72); } }\n' +
+  '  @keyframes ppSnap { 0% { transform: scale(1); } 30% { transform: scale(1.1, .85); } 60% { transform: scale(.96, 1.06); } 100% { transform: scale(1); } }\n' +
+  '  @keyframes ppRiffle {\n' +
+  '    0%   { transform: scaleX(1) rotate(0); }\n' +
+  '    45%  { transform: scaleX(-.12) rotate(-2deg); }\n' +
+  '    100% { transform: scaleX(-.88) rotate(-3deg); }\n' +
+  '  }\n' +
+  '  @keyframes ppPuff {\n' +
+  '    0%   { opacity: 0; transform: translate(0,0) scale(.4); }\n' +
+  '    18%  { opacity: .6; }\n' +
+  '    100% { opacity: 0; transform: translate(var(--px), var(--py)) scale(1.25); }\n' +
+  '  }\n' +
+  '  @keyframes ppStamp {\n' +
+  '    0%   { transform: translate(0,-40px) scale(1); opacity: 0; }\n' +
+  '    9%   { transform: translate(0,-22px) scale(1); opacity: 1; }\n' +
+  '    26%  { transform: translate(0,-26px) scale(1); }          /* anticipation rise */\n' +
+  '    36%  { transform: translate(0,1px)   scale(1.06,.86); }   /* slam + squash */\n' +
+  '    44%  { transform: translate(0,0)     scale(1); }\n' +
+  '    58%  { transform: translate(0,0)     scale(1); }          /* press-and-hold */\n' +
+  '    68%  { transform: translate(0,-9px)  scale(1); }\n' +
+  '    82%  { transform: translate(0,-36px) scale(1); opacity: .9; }\n' +
+  '    100% { transform: translate(0,-40px) scale(1); opacity: 0; }\n' +
+  '  }\n' +
+  '  @keyframes ppStampHit { 0% { transform: scale(1); } 30% { transform: scale(1.08,.9); } 60% { transform: scale(.97,1.05); } 100% { transform: scale(1); } }\n' +
+  '  @keyframes ppVisaPop { 0%,100% { transform: scale(1); } 35% { transform: scale(1.4); } 65% { transform: scale(.88); } }\n' +
+  '  @keyframes ppSigh { 0%,100% { transform: scale(1); } 30% { transform: scale(1.02, 1.05); } 68% { transform: scale(.985, .965); } }\n' +
+  '  @keyframes ppChase {\n' +
+  '    0%   { transform: rotateY(0)       translateY(0); }\n' +
+  '    30%  { transform: rotateY(360deg)  translateY(-3px); }\n' +
+  '    62%  { transform: rotateY(760deg)  translateY(-5px); }\n' +
+  '    100% { transform: rotateY(1080deg) translateY(0); }\n' +
+  '  }\n' +
+  '  @keyframes ppShadowChase { 0%,100% { transform: scale(1); opacity: .17; } 50% { transform: scale(.82); opacity: .11; } }\n' +
+  '  @keyframes ppDizzy {\n' +
+  '    0%,100% { transform: translate(0,0); }\n' +
+  '    15% { transform: translate(1.1px,-.5px); }\n' +
+  '    35% { transform: translate(0,-1.2px); }\n' +
+  '    55% { transform: translate(-1.1px,-.4px); }\n' +
+  '    75% { transform: translate(0,.6px); }\n' +
+  '  }\n' +
+  '  @keyframes ppScan {\n' +
+  '    0%   { transform: translateY(-8px); opacity: 0; }\n' +
+  '    10%  { opacity: .8; }\n' +
+  '    55%  { transform: translateY(42px); opacity: .8; }\n' +
+  '    100% { transform: translateY(-8px); opacity: 0; }\n' +
+  '  }\n' +
+  '  @keyframes ppSweat {\n' +
+  '    0%   { opacity: 0; transform: translate(0,0) scale(.5); }\n' +
+  '    18%  { opacity: .95; }\n' +
+  '    55%  { opacity: .9; transform: translate(8px,-6px) scale(1); }\n' +
+  '    100% { opacity: 0; transform: translate(15px,6px) scale(1); }\n' +
+  '  }\n' +
+  '  @keyframes ppGlideBob { 0%,100% { transform: rotate(12deg) translateY(0); } 50% { transform: rotate(13.5deg) translateY(-2.4px); } }\n' +
+  '  @keyframes ppWingF { 0%,100% { transform: scaleX(.46); } 50% { transform: scaleX(.34); } }\n' +
+  '  @keyframes ppWingB { 0%,100% { transform: scaleX(-.5); } 50% { transform: scaleX(-.36); } }\n' +
+  '  @keyframes ppShine {\n' +
+  '    0%   { opacity: 0; transform: translateX(-6px); }\n' +
+  '    20%  { opacity: .85; }\n' +
+  '    100% { opacity: 0; transform: translateX(10px); }\n' +
+  '  }\n' +
+  '\n  /* ---- reduced motion: single static sitting pose ---- */\n' +
+  '  @media (prefers-reduced-motion: reduce) {\n' +
+  '    #m-passi, #m-passi * { animation: none !important; transition: none !important; }\n' +
+  '  }\n' +
+  '';
+
+  var SVG = '' +
+  '<svg class="char" id="pp-passi" width="62" height="73.92" viewBox="0 0 52 62" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">\n' +
+  '  <title>Passi the passport</title>\n' +
+  '  <defs>\n' +
+  '    <clipPath id="pp-cpEm"><circle cx="24.7" cy="34" r="4.1"/></clipPath>\n' +
+  '    <clipPath id="pp-cpFan"><rect x="36" y="8.2" width="4.2" height="40" rx="1.5"/></clipPath>\n' +
+  '    <clipPath id="pp-cpBody"><rect x="10.5" y="6" width="31" height="45" rx="4"/></clipPath>\n' +
+  '  </defs>\n' +
+  '  <g id="pp-root">\n' +
+  '    <!-- stubby legs -->\n' +
+  '    <g id="pp-legL">\n' +
+  '      <rect x="16.8" y="46" width="5.6" height="11" rx="2.8" fill="#881337" stroke="#4C0519" stroke-width=".8"/>\n' +
+  '      <ellipse cx="19.8" cy="57.8" rx="4.2" ry="2.1" fill="#6B1130" stroke="#4C0519" stroke-width=".8"/>\n' +
+  '    </g>\n' +
+  '    <g id="pp-legR">\n' +
+  '      <rect x="29.6" y="46" width="5.6" height="11" rx="2.8" fill="#881337" stroke="#4C0519" stroke-width=".8"/>\n' +
+  '      <ellipse cx="32.6" cy="57.8" rx="4.2" ry="2.1" fill="#6B1130" stroke="#4C0519" stroke-width=".8"/>\n' +
+  '    </g>\n' +
+  '    <g id="pp-trunk">\n' +
+  '      <g id="pp-breathe">\n' +
+  '        <!-- back cover wing: a sliver behind the spine until the glide unfolds it -->\n' +
+  '        <g id="pp-wingB">\n' +
+  '          <path d="M12.2,11 Q12.2,7.4 15.8,7.4 L36,7.4 Q39.6,7.4 39.6,11 L39.6,45 Q39.6,48.6 36,48.6 L15.8,48.6 Q12.2,48.6 12.2,45 Z"\n' +
+  '                fill="#9F1239" stroke="#4C0519" stroke-width="1.2" stroke-linejoin="round"/>\n' +
+  '        </g>\n' +
+  '        <!-- back cover + spine shading -->\n' +
+  '        <g id="pp-back">\n' +
+  '          <rect x="11.5" y="6.8" width="29.4" height="42.6" rx="4.2" fill="#881337" stroke="#4C0519" stroke-width="1.4"/>\n' +
+  '          <rect x="11.9" y="7.6" width="2.6" height="41" rx="1.3" fill="#4C0519" opacity=".35"/>\n' +
+  '        </g>\n' +
+  '        <!-- fanned page edges along the open side -->\n' +
+  '        <g id="pp-fan">\n' +
+  '          <rect x="13" y="8.2" width="26.6" height="39.8" rx="3.4" fill="#FDE68A" stroke="#B45309" stroke-width=".5"/>\n' +
+  '          <rect x="13" y="8.9" width="25.4" height="38.4" rx="3" fill="#FFF7ED" stroke="#E7CFA0" stroke-width=".4"/>\n' +
+  '          <rect x="13" y="9.6" width="24.2" height="37" rx="2.8" fill="#FEF3C7" stroke="#EAD9A8" stroke-width=".4"/>\n' +
+  '          <!-- dog-eared corner: flutters idly, lifts while he reads -->\n' +
+  '          <g id="pp-corner">\n' +
+  '            <path d="M36.4,9.6 L39.2,9.6 L39.2,12.8 Q37.5,10.6 36.4,9.6 Z" fill="#FDE68A" stroke="#D97706" stroke-width=".45"/>\n' +
+  '          </g>\n' +
+  '          <!-- gilded edge glint (clipped to the fan) -->\n' +
+  '          <g clip-path="url(#pp-cpFan)"><g id="pp-shineFan" class="streak">\n' +
+  '            <rect x="36.6" y="6" width="1.7" height="44" fill="#FFFFFF" transform="rotate(14 37.5 28)"/>\n' +
+  '          </g></g>\n' +
+  '        </g>\n' +
+  '        <!-- inner visa page: revealed whenever the cover swings open -->\n' +
+  '        <g id="pp-inner">\n' +
+  '          <rect x="13.4" y="10" width="23.4" height="36.4" rx="2.6" fill="#FFFBEB" stroke="#D6BE8A" stroke-width=".5"/>\n' +
+  '          <line x1="16.4" y1="14" x2="27.4" y2="14" stroke="#B45309" stroke-width="1" stroke-linecap="round" opacity=".65"/>\n' +
+  '          <line x1="16.4" y1="16.4" x2="22.4" y2="16.4" stroke="#D97706" stroke-width=".7" stroke-linecap="round" opacity=".5"/>\n' +
+  '          <line x1="16" y1="28" x2="34" y2="28" stroke="#EAD9A8" stroke-width=".5" stroke-dasharray="1.4 1.2"/>\n' +
+  '          <line x1="16" y1="40.9" x2="33.6" y2="40.9" stroke="#E7CFA0" stroke-width=".5"/>\n' +
+  '          <!-- visa stamps: earned via visastamp, persist for the session -->\n' +
+  '          <g id="pp-visa1" class="visa"><g transform="rotate(-9 19.5 22.5)">\n' +
+  '            <rect x="15.7" y="19.9" width="7.6" height="5.2" rx="1" fill="#DBEAFE" stroke="#2563EB" stroke-width=".6"/>\n' +
+  '            <line x1="17" y1="21.6" x2="22" y2="21.6" stroke="#2563EB" stroke-width=".55" stroke-linecap="round"/>\n' +
+  '            <line x1="17" y1="23.3" x2="20.4" y2="23.3" stroke="#60A5FA" stroke-width=".55" stroke-linecap="round"/>\n' +
+  '          </g></g>\n' +
+  '          <g id="pp-visa2" class="visa"><g transform="rotate(8 30 21.5)">\n' +
+  '            <circle cx="30" cy="21.5" r="3" fill="#D1FAE5" stroke="#059669" stroke-width=".6"/>\n' +
+  '            <path d="M28.6,21.6 L29.6,22.6 L31.5,20.5" fill="none" stroke="#047857" stroke-width=".7" stroke-linecap="round" stroke-linejoin="round"/>\n' +
+  '          </g></g>\n' +
+  '          <g id="pp-visa3" class="visa"><g transform="rotate(-7 19 33.5)">\n' +
+  '            <path d="M19,30.6 L19.7,32.1 L21.3,32.3 L20.2,33.4 L20.4,35 L19,34.3 L17.6,35 L17.8,33.4 L16.7,32.3 L18.3,32.1 Z"\n' +
+  '                  fill="#EDE9FE" stroke="#7C3AED" stroke-width=".5" stroke-linejoin="round"/>\n' +
+  '          </g></g>\n' +
+  '          <g id="pp-visa4" class="visa"><g transform="rotate(10 30.5 34.5)">\n' +
+  '            <ellipse cx="30.5" cy="34.5" rx="3.6" ry="2.5" fill="#FFEDD5" stroke="#EA580C" stroke-width=".6"/>\n' +
+  '            <path d="M28.4,35.3 Q30.5,32.9 32.6,34.1" fill="none" stroke="#EA580C" stroke-width=".55" stroke-linecap="round"/>\n' +
+  '          </g></g>\n' +
+  '          <!-- countdown digits ride the same --sx/--sy offsets as the stamp rig -->\n' +
+  '          <g id="pp-visaNumW"><text id="pp-visaNum" x="25" y="30.6" text-anchor="middle"\n' +
+  '                font-family="Trebuchet MS, Segoe UI, sans-serif" font-size="4.6" font-weight="700"\n' +
+  '                fill="#1E3A8A">7</text></g>\n' +
+  '        </g>\n' +
+  '        <!-- riffle pages: invisible until the thumb-fan -->\n' +
+  '        <g id="pp-pg1" class="rif"><rect x="13.5" y="10.4" width="23" height="35.6" rx="2.4" fill="#FFF7ED" stroke="#E2CE9F" stroke-width=".5"/></g>\n' +
+  '        <g id="pp-pg2" class="rif"><rect x="13.5" y="10.8" width="22.6" height="34.8" rx="2.4" fill="#FEF3C7" stroke="#E2CE9F" stroke-width=".5"/></g>\n' +
+  '        <g id="pp-pg3" class="rif"><rect x="13.5" y="10.6" width="22.8" height="35.2" rx="2.4" fill="#FFFBEB" stroke="#E2CE9F" stroke-width=".5"/></g>\n' +
+  '        <g id="pp-pg4" class="rif"><rect x="13.5" y="11" width="22.4" height="34.4" rx="2.4" fill="#FDE68A" stroke="#D9B45C" stroke-width=".5"/></g>\n' +
+  '        <!-- front cover: hinged at the spine, carries the face -->\n' +
+  '        <g id="pp-coverF">\n' +
+  '          <rect x="12.5" y="7" width="24.6" height="42" rx="4" fill="#9F1239" stroke="#4C0519" stroke-width="1.4"/>\n' +
+  '          <rect x="14.6" y="9.2" width="20.4" height="37.6" rx="2.6" fill="none" stroke="#FCD34D" stroke-width=".5" opacity=".55"/>\n' +
+  '          <g id="pp-face">\n' +
+  '            <ellipse cx="20.2" cy="19.5" rx="3.5" ry="4" fill="#FFFFFF" stroke="#4C0519" stroke-width="1"/>\n' +
+  '            <ellipse cx="29.2" cy="19.5" rx="3.5" ry="4" fill="#FFFFFF" stroke="#4C0519" stroke-width="1"/>\n' +
+  '            <g id="pp-pupils">\n' +
+  '              <circle cx="20.9" cy="20" r="1.7" fill="#3B0716"/>\n' +
+  '              <circle cx="29.9" cy="20" r="1.7" fill="#3B0716"/>\n' +
+  '              <circle cx="21.5" cy="19.2" r=".6" fill="#FFFFFF"/>\n' +
+  '              <circle cx="30.5" cy="19.2" r=".6" fill="#FFFFFF"/>\n' +
+  '            </g>\n' +
+  '            <g id="pp-lids">\n' +
+  '              <rect x="16.5" y="15.3" width="7.4" height="8.8" rx="3.7" fill="#9F1239" stroke="#4C0519" stroke-width=".6"/>\n' +
+  '              <rect x="25.5" y="15.3" width="7.4" height="8.8" rx="3.7" fill="#9F1239" stroke="#4C0519" stroke-width=".6"/>\n' +
+  '            </g>\n' +
+  '            <!-- happy squint ^ ^ overlay -->\n' +
+  '            <g id="pp-squint">\n' +
+  '              <path d="M17.4,20.6 Q20.2,17.8 23,20.6" fill="none" stroke="#3B0716" stroke-width="1.4" stroke-linecap="round"/>\n' +
+  '              <path d="M26.4,20.6 Q29.2,17.8 32,20.6" fill="none" stroke="#3B0716" stroke-width="1.4" stroke-linecap="round"/>\n' +
+  '            </g>\n' +
+  '            <path d="M22.6,25.4 Q24.7,27.4 26.8,25.4" fill="none" stroke="#3B0716" stroke-width="1.2" stroke-linecap="round"/>\n' +
+  '            <ellipse class="blush" cx="16.9" cy="23.8" rx="1.7" ry="1.1" fill="#F9A8D4" opacity=".5"/>\n' +
+  '            <ellipse class="blush" cx="32.5" cy="23.8" rx="1.7" ry="1.1" fill="#F9A8D4" opacity=".5"/>\n' +
+  '          </g>\n' +
+  '          <!-- golden globe emblem -->\n' +
+  '          <g id="pp-emblem">\n' +
+  '            <circle cx="24.7" cy="34" r="4.4" fill="#FCD34D" stroke="#D97706" stroke-width=".8"/>\n' +
+  '            <ellipse cx="24.7" cy="34" rx="1.9" ry="4" fill="none" stroke="#D97706" stroke-width=".5"/>\n' +
+  '            <line x1="20.7" y1="34" x2="28.7" y2="34" stroke="#D97706" stroke-width=".5"/>\n' +
+  '            <path d="M21.2,31.8 Q24.7,30.6 28.2,31.8 M21.2,36.2 Q24.7,37.4 28.2,36.2" fill="none" stroke="#D97706" stroke-width=".45"/>\n' +
+  '            <g clip-path="url(#pp-cpEm)"><g id="pp-shineEm" class="streak">\n' +
+  '              <rect x="23.4" y="28.6" width="1.8" height="11" fill="#FFFFFF" transform="rotate(22 24.3 34)"/>\n' +
+  '            </g></g>\n' +
+  '          </g>\n' +
+  '          <!-- PASSPORT squiggles -->\n' +
+  '          <line x1="19.4" y1="42.2" x2="30" y2="42.2" stroke="#FCD34D" stroke-width="1" stroke-linecap="round" opacity=".85"/>\n' +
+  '          <line x1="21.4" y1="44.6" x2="28" y2="44.6" stroke="#FCD34D" stroke-width=".8" stroke-linecap="round" opacity=".55"/>\n' +
+  '          <!-- ARRIVED corner stamp: slams in when the trip goes live -->\n' +
+  '          <g transform="translate(31.4,11.6)"><g id="pp-arrived">\n' +
+  '            <rect x="-5" y="-2.5" width="10" height="5" rx="1.2" fill="none" stroke="#FCD34D" stroke-width=".9"/>\n' +
+  '            <line x1="-3.3" y1="-.7" x2="3.3" y2="-.7" stroke="#FCD34D" stroke-width=".7" stroke-linecap="round"/>\n' +
+  '            <line x1="-2.3" y1="1.1" x2="2.3" y2="1.1" stroke="#FCD34D" stroke-width=".6" stroke-linecap="round" opacity=".8"/>\n' +
+  '          </g></g>\n' +
+  '        </g>\n' +
+  '        <!-- bookmark ribbon: the tail -->\n' +
+  '        <g id="pp-ribbon">\n' +
+  '          <path d="M15.2,7.4 C13.7,12.6 12.8,17.8 13.2,23.4 L12.4,26.2 L14.7,24.5 L16.2,26.4 L16.7,23.2 C15.7,17.9 16.3,12.6 17.8,8 Z"\n' +
+  '                fill="#F472B6" stroke="#DB2777" stroke-width=".7" stroke-linejoin="round"/>\n' +
+  '          <path d="M15.9,9.4 C14.9,13.8 14.4,18.4 14.7,22.6" fill="none" stroke="#DB2777" stroke-width=".45" opacity=".6"/>\n' +
+  '        </g>\n' +
+  '      </g>\n' +
+  '    </g>\n' +
+  '  </g>\n' +
+  '  <!-- ground dust puff (feet level, outside the airborne groups) -->\n' +
+  '  <g id="pp-puffG">\n' +
+  '    <circle class="pg" cx="20" cy="58.4" r="1.6" fill="#E2E8F0" style="--px:-8px;--py:-3px"/>\n' +
+  '    <circle class="pg" cx="32" cy="58.4" r="1.4" fill="#F1F5F9" style="--px:8px;--py:-4px"/>\n' +
+  '    <circle class="pg" cx="24" cy="59" r="1.1" fill="#CBD5E1" style="--px:-4px;--py:-6px"/>\n' +
+  '    <circle class="pg" cx="28.5" cy="59" r="1.2" fill="#E2E8F0" style="--px:4px;--py:-6px"/>\n' +
+  '  </g>\n' +
+  '  <!-- paper dust motes: fly off the page edge during the riffle -->\n' +
+  '  <g id="pp-dust">\n' +
+  '    <rect class="pd" x="38.6" y="20" width="1.6" height="1.6" fill="#FEF3C7" style="--px:7px;--py:-6px"/>\n' +
+  '    <circle class="pd" cx="39.6" cy="27" r=".9" fill="#FFF7ED" style="--px:9px;--py:-2px"/>\n' +
+  '    <rect class="pd" x="38.2" y="32" width="1.4" height="1.4" fill="#FDE68A" style="--px:6px;--py:3px"/>\n' +
+  '    <circle class="pd" cx="39.9" cy="15.5" r=".8" fill="#FFF7ED" style="--px:8px;--py:-8px"/>\n' +
+  '    <rect class="pd" x="39" y="38.5" width="1.3" height="1.3" fill="#FEF3C7" style="--px:7px;--py:6px"/>\n' +
+  '  </g>\n' +
+  '  <!-- stamp-impact puff (follows --sx/--sy to the visa slot) -->\n' +
+  '  <g id="pp-puffV">\n' +
+  '    <circle class="pv" cx="23" cy="27" r="1.1" fill="#FDE68A" style="--px:-5px;--py:-4px"/>\n' +
+  '    <circle class="pv" cx="27" cy="26.5" r=".9" fill="#F1F5F9" style="--px:5px;--py:-4px"/>\n' +
+  '    <path class="pv" d="M25,23.8 L25.6,25.1 L27,25.4 L26,26.3 L26.3,27.7 L25,27 L23.7,27.7 L24,26.3 L23,25.4 L24.4,25.1 Z"\n' +
+  '          fill="#FCD34D" style="--px:1px;--py:-7px"/>\n' +
+  '    <circle class="pv" cx="24" cy="28.2" r=".8" fill="#E2E8F0" style="--px:-3px;--py:-6px"/>\n' +
+  '  </g>\n' +
+  '  <!-- visa stamp rig: descends from above the strip -->\n' +
+  '  <g id="pp-stampRig"><g id="pp-stampAnim"><g transform="translate(0,9)">\n' +
+  '    <rect x="22.6" y="6" width="4.8" height="4.4" rx="2" fill="#B45309" stroke="#7C2D12" stroke-width=".8"/>\n' +
+  '    <rect x="23.7" y="9.9" width="2.6" height="5.6" fill="#D97706" stroke="#7C2D12" stroke-width=".7"/>\n' +
+  '    <path d="M20.6,19.6 L20.6,17.5 Q20.6,15.3 22.8,15.3 L27.2,15.3 Q29.4,15.3 29.4,17.5 L29.4,19.6 Z"\n' +
+  '          fill="#312E81" stroke="#1E1B4B" stroke-width=".8"/>\n' +
+  '  </g></g></g>\n' +
+  '  <!-- inspection scan beam (clipped to the body silhouette) -->\n' +
+  '  <g clip-path="url(#pp-cpBody)"><g id="pp-scan" class="streak">\n' +
+  '    <rect x="8" y="2" width="36" height="4.6" fill="#BAE6FD" opacity=".5"/>\n' +
+  '    <rect x="8" y="3.6" width="36" height="1.2" fill="#F0F9FF"/>\n' +
+  '  </g></g>\n' +
+  '</svg>';
+
+  var SHADOW = '<svg class="shadow" id="pp-shadow" width="56" height="9" viewBox="0 0 56 9" aria-hidden="true">\n' +
+  '  <ellipse cx="28" cy="4.5" rx="24" ry="3.5" fill="#000"/>\n' +
+  '</svg>';
+
+  var FX = '<div class="fx" id="pp-fx">\n' +
+  '  <span class="zz z1">z</span>\n' +
+  '  <span class="zz z2">z</span>\n' +
+  '  <span class="zz z3">z</span>\n' +
+  '  <span class="drop"></span>\n' +
+  '</div>';
+
+  // ribbon micro-motion + landing dust, shared by several states
+  function twitchRibbon(k) { k.addC('twitch'); k.later(function () { k.remC('twitch'); }, 600); }
+  function puffGround(k) { k.pulse('puffG', 800); }
+
+  TrekMascots.register({
+    id: 'passi',
+    name: 'Passi',
+    tagline: 'the passport — valid for wherever',
+    width: 62,
+    height: 74,
+    css: CSS,
+    svg: SVG,
+    shadow: SHADOW,
+    fx: FX,
+    moods: ['chill', 'soon', 'hype', 'live'],
+    reducedPose: 'pose-sit',
+    signature: 'riffle',
+    shineClasses: ['sh1', 'sh2'],
+    blinkEvery: [2100, 5200],
+    stateClasses: ['st-walk', 'st-idle', 'st-sit', 'st-sleep', 'st-stretch', 'st-wave', 'st-jump',
+      'st-peek', 'st-riffle', 'st-visastamp', 'st-gaze', 'st-glide', 'st-ribbonchase', 'st-inspection',
+      'pose-sit', 'cover-open', 'snap', 'flare', 'dusty', 'riffling',
+      'look-down', 'look-up', 'look-l', 'look-r', 'eyes-closed', 'hop', 'squint', 'twitch',
+      'stamping', 'stamp-hit', 'visa-num', 'puffG', 'puffV', 'visa-b1', 'visa-b2', 'visa-b3', 'visa-b4',
+      'glide-out', 'gliding', 'rigid', 'scanning', 'phew', 'sweat', 'sigh', 'dizzy'],
+    edgeStates: { peek: true },
+    afterState: { sleep: 'stretch', stretch: 'idle' },
+    glide: { state: 'glide', outClass: 'glide-out', spinClass: 'gliding', boost: 1.6 },
+    config: {
+      turnPad: 18,
+      edgeSnap: 34,
+      // a touch quicker than the suitcase in every mood; lightest of the family
+      speed: { chill: 30, soon: 43, hype: 68, live: 37 },
+      step:  { chill: '0.64s', soon: '0.5s', hype: '0.34s', live: '0.58s' },
+      waveEveryMs: 80000,
+      dur: {
+        walk: [2400, 6800], idle: [1400, 3200], sit: [3000, 7000], sleep: [6500, 12000],
+        stretch: [1750, 1750], wave: [2100, 2100], jump: [1100, 1100], peek: [2000, 3400],
+        riffle: [3050, 3050], visastamp: [3650, 3650], gaze: [3900, 3900],
+        glide: [4600, 4600], ribbonchase: [3250, 3250], inspection: [3900, 3900]
+      },
+      weights: {
+        chill: { walk: 5, idle: 4,   sit: 3,   gaze: 2.2, wave: .7,  jump: .6,  peek: 1.2, riffle: 1.2, ribbonchase: .5,  glide: .3,  visastamp: .35, inspection: .45 },
+        soon:  { walk: 6, idle: 3,   sit: 1.6, gaze: 1.6, wave: 1,   jump: 1.8, peek: 1.2, riffle: 1.5, ribbonchase: .7,  glide: .45, visastamp: .4,  inspection: .5 },
+        hype:  { walk: 7, idle: 1.3, sit: .4,  gaze: .7,  wave: 2,   jump: 3.6, peek: 1.2, riffle: 2.1, ribbonchase: 1.1, glide: .6,  visastamp: 1,   inspection: .35 },
+        live:  { walk: 5, idle: 3,   sit: 2.2, gaze: 1.4, wave: 1.2, jump: 1.3, peek: 1,   riffle: 1.3, ribbonchase: .8,  glide: 1.15, visastamp: .5, inspection: .6 }
+      },
+      sleepFromSit: { chill: 2.6, soon: 1.2, hype: 0, live: 1 }
+    },
+
+    // visa slots on the inner page: [--sx, --sy] offsets for stamp rig, puff and digits
+    _slots: [[-5.5, -6], [5, -7], [-6, 5], [5.5, 6]],
+
+    onTurn: function (k) { k.pulse('flutter', 640); },  // ribbon flutters on turn-around
+    onGlideTuck: function (k) { puffGround(k); k.pulse('flare', 700); }, // paper settles after landing
+    filterWeights: function (k, w) {
+      // a real countdown makes stamping extra tempting
+      if (k.mood === 'hype' && k.tripDays != null) w.visastamp = (w.visastamp || 0) + 1.1;
+    },
+    moodFromTrip: function (days, ongoing) {
+      if (ongoing === true) return 'live';
+      if (days !== null && days >= 0 && days <= 7) return 'hype';
+      if (days !== null && days > 7 && days <= 14) return 'soon';
+      return 'chill';
+    },
+    onMood: function (k, m, changed) {
+      if (m === 'live') {
+        if (!k._arrived) {
+          k._arrived = true;
+          setTimeout(function () { if (k._arrived) k.addC('arrived-on'); }, 700);
+        }
+      } else if (k._arrived) {
+        k._arrived = false;
+        k.remC('arrived-on');
+      }
+      if (changed && m === 'hype' && !TrekMascots.reduced && (k.state === 'sleep' || k.state === 'sit')) {
+        k.setState(k.state === 'sleep' ? 'stretch' : 'jump');
+      }
+    },
+    // always-on paper rustle; the closer the trip, the twitchier the pages
+    ambient: function (k) {
+      (function rustle() {
+        var span = k.mood === 'soon' ? [6000, 11000] : k.mood === 'hype' ? [8000, 14000] : [16000, 30000];
+        setTimeout(function () {
+          if (k.dead) return;
+          if (k.state !== 'sleep') k.pulse('flare', 700);
+          rustle();
+        }, TrekMascots.rand(span[0], span[1]));
+      })();
+    },
+
+    enter: {
+      walk: function (k) { if (Math.random() < .3) k.setDir(-k.dir); },
+      idle: function (k) {
+        if (Math.random() < .8) k.later(function () {
+          k.addC(Math.random() < .5 ? 'look-l' : 'look-r');
+          k.later(function () { k.remC('look-l'); k.remC('look-r'); }, k.rand(500, 900));
+        }, k.rand(300, 1200));
+        if (Math.random() < .5) k.later(function () { twitchRibbon(k); }, k.rand(600, 1800));
+      },
+      sit: function (k) {
+        k.addC('pose-sit');
+        if (Math.random() < .6) k.later(function () { twitchRibbon(k); }, k.rand(1000, 3000));
+      },
+      sleep: function () {},  // st-sleep owns the whole lie-down; nothing to add
+      stretch: function (k) { k.addC('eyes-closed'); k.later(function () { k.remC('eyes-closed'); }, 650); },
+      wave: function (k) {
+        k.lastWave = performance.now();
+        k.later(function () { k.addC('squint'); }, 450);
+        k.later(function () { k.remC('squint'); }, 1550);
+      },
+      jump: function (k) {
+        k.later(function () { k.addC('squint'); }, 300);
+        k.later(function () { k.pulse('flare', 600); }, 400);   // pages flutter at apex
+        k.later(function () { k.remC('squint'); }, 700);
+        k.later(function () { puffGround(k); }, 810);           // dust on landing
+        if (k.mood === 'hype') k.later(function () { k.pulse('dusty', 800); }, 830);
+      },
+      peek: function (k) {
+        k.setDir(k.x - k.minX < k.maxX - k.x ? -1 : 1);
+        k.later(function () { k.addC('look-down'); }, 380);
+      },
+      // signature move: the Riffle — thumb-fans every page, snaps shut, hops
+      riffle: function (k) {
+        k.later(function () { k.addC('cover-open'); }, 150);
+        k.later(function () { k.addC('look-down'); }, 420);
+        k.later(function () { k.addC('riffling'); }, 620);
+        k.later(function () { k.pulse('dusty', 800); }, 760);
+        k.later(function () { k.pulse('dusty', 800); }, 1450);
+        k.later(function () { k.remC('riffling'); }, 1980);
+        k.later(function () { k.remC('look-down'); k.remC('cover-open'); }, 2120);
+        k.later(function () { k.pulse('snap', 520); puffGround(k); }, 2200);
+        k.later(function () { k.addC('squint'); k.pulse('hop', 500); }, 2320);
+        k.later(function () { k.remC('squint'); }, 2950);
+      },
+      // border control, self-service: opens flat and stamps his own visa page
+      visastamp: function (k) {
+        var count = k._visas || 0;
+        var n = count < 4 ? count + 1 : 1 + Math.floor(Math.random() * 4);
+        var slot = TrekMascots.get('passi')._slots[n - 1];
+        k.el.style.setProperty('--sx', slot[0] + 'px');
+        k.el.style.setProperty('--sy', slot[1] + 'px');
+        var showDays = k.mood === 'hype' && k.tripDays != null;
+        k.later(function () { k.addC('cover-open'); }, 140);
+        k.later(function () { k.addC('stamping'); }, 420);
+        k.later(function () { k.addC('look-up'); }, 520);
+        k.later(function () {                            // impact frame
+          k.remC('look-up');
+          k.addC('stamp-hit');
+          k.pulse('puffV');
+          if (count < 4) { k.addC('visa-on-' + n); k._visas = count + 1; }
+          else { k.addC('visa-b' + n); k.later(function () { k.remC('visa-b' + n); }, 700); }
+          if (showDays) {
+            var num = k.el.querySelector('#pp-visaNum');
+            if (num) num.textContent = String(TrekMascots.clamp(Math.round(k.tripDays), 0, 99));
+            k.addC('visa-num');
+          }
+        }, 1300);
+        k.later(function () { k.remC('stamp-hit'); k.remC('puffV'); }, 1950);
+        k.later(function () { k.addC('look-down'); }, 2250);  // admire the fresh ink
+        k.later(function () { k.addC('squint'); }, 2500);
+        k.later(function () { k.pulse('hop', 500); }, 2750);
+        k.later(function () { k.remC('cover-open'); }, 3050);
+        k.later(function () { k.pulse('snap', 520); }, 3100);
+        k.later(function () { k.remC('squint'); k.remC('look-down'); }, 3350);
+      },
+      // reads his own visas like a photo album
+      gaze: function (k) {
+        k.later(function () { k.addC('cover-open'); }, 200);
+        k.later(function () { k.addC('look-down'); }, 520);
+        k.later(function () { k.addC('squint'); }, 1500);
+        k.later(function () { k.remC('squint'); }, 2300);
+        k.later(function () { k.pulse('sigh', 750); }, 2700);  // content exhale
+        k.later(function () { k.remC('look-down'); }, 3350);
+        k.later(function () { k.remC('cover-open'); }, 3550);
+      },
+      // glide mode: covers half-open as wings, lean forward and sail
+      glide: function (k) {
+        k.setDir(k.x - k.minX < k.maxX - k.x ? 1 : -1);  // glide toward the long side
+        k.forceNext = 'walk';                            // always resume walking after
+        k.glideTucked = false;
+        k.addC('glide-out');
+        k.later(function () { k.glideMoving = true; k.addC('gliding'); }, 430);
+        k.later(function () {                            // catch an imaginary updraft
+          if (k.glideMoving) k.pulse('hop', 500);
+        }, k.rand(1500, 2700));
+        k.later(function () { k.tuckGlide(); }, 3550);   // fold up, paper settles
+      },
+      // chases his own bookmark like a puppy; ends dizzy and embarrassed
+      ribbonchase: function (k) {
+        k.later(function () { k.addC('look-l'); }, 150);
+        k.later(function () { puffGround(k); }, 250);
+        k.later(function () { k.remC('look-l'); puffGround(k); }, 1950);  // skid stop
+        k.later(function () { k.addC('dizzy'); }, 2100);
+        k.later(function () { k.remC('dizzy'); }, 3080);
+      },
+      // passport control: stands VERY straight, holds breath under the scanner
+      inspection: function (k) {
+        k.later(function () { k.addC('rigid'); }, 150);
+        k.later(function () { k.addC('scanning'); }, 600);
+        k.later(function () {                            // cleared. breathe again
+          k.remC('scanning');
+          k.remC('rigid');
+          k.addC('phew');
+          k.addC('eyes-closed');
+          k.pulse('sweat', 1100);
+        }, 2550);
+        k.later(function () { k.pulse('sigh', 750); }, 2900);
+        k.later(function () { k.remC('eyes-closed'); }, 3150);
+        k.later(function () { k.remC('phew'); }, 3550);
+      }
+    }
+  });
+})();
+</script>
+<!-- characters/puffi.js -->
+<script>
+// Puffi -- a chronically sleepy mint-teal neck pillow. The U stands on its own
+// two ends, the sleep mask lives on his forehead until nap time, and the deep
+// breathing never stops -- a pillow is soft full-time.
+(function () {
+  'use strict';
+
+  var CSS = "" +
+    "\n/* ---- moving root: JS drives translate3d(x) ---- */\n" +
+    "#m-puffi .jumper, #m-puffi .flip { position: absolute; inset: 0; }\n" +
+    "#m-puffi .jumper { transform-origin: 50% 100%; }\n" +
+    "#m-puffi .flip { transition: transform .3s ease; transform-origin: 50% 50%; }\n" +
+    "#m-puffi .char { display: block; position: absolute; left: 0; bottom: 0; overflow: visible; filter: drop-shadow(0 1px 1px rgba(2,6,23,.35)) drop-shadow(0 0 1px rgba(248,250,252,.3)); }\n" +
+    "\n/* ---- ground shadow ---- */\n" +
+    "#m-puffi .shadow { position: absolute; left: 50%; bottom: 0; margin-left: -32px; opacity: .17; filter: blur(1.1px); transform-origin: 50% 100%; transition: transform .4s ease, opacity .4s ease; }\n" +
+    "#m-puffi.pose-sit .shadow { transform: scaleX(1.14); opacity: .21; }\n" +
+    "\n/* ---- SVG group plumbing: CSS transforms in viewBox units ---- */\n" +
+    "#pf-root, #pf-jitter, #pf-breathe, #pf-body, #pf-legL, #pf-legR, #pf-face, #pf-pupils, #pf-lids, #pf-squint, #pf-brows, #pf-mouth, #pf-yawnO, #pf-cheeks, #pf-maskCup, #pf-strap, #pf-umb, #pf-blushDeep, #pf-bags { transform-box: view-box; }\n" +
+    "#pf-root { transform-origin: 35px 60px; transition: transform .55s cubic-bezier(.4,0,.3,1); }\n" +
+    "#pf-breathe { transform-origin: 35px 60px; animation: pfBreathe 4.8s ease-in-out infinite; }\n" +
+    "#pf-body { transform-origin: 35px 60px; }\n" +
+    "#pf-legL { transform-origin: 18px 60px; transition: transform .5s cubic-bezier(.34,1.4,.64,1); }\n" +
+    "#pf-legR { transform-origin: 52px 60px; transition: transform .5s cubic-bezier(.34,1.4,.64,1); }\n" +
+    "/* heavy lids: never fully open, blink just finishes the job */\n" +
+    "#pf-lids { transform-origin: 35px 13.2px; transform: scaleY(.28); transition: transform .13s ease-out; }\n" +
+    "#pf-pupils { transition: transform .35s ease, opacity .12s ease; animation: pfDrift 13s ease-in-out infinite; }\n" +
+    "#pf-strap { transform-origin: 58.6px 25.5px; animation: pfStrapIdle 4.6s ease-in-out infinite; }\n" +
+    "#m-puffi.mood-uneasy #pf-strap { animation-duration: 2.7s; }\n" +
+    "#pf-maskCup { transform-origin: 35px 12px; transform: rotate(-7deg); transition: transform .6s cubic-bezier(.34,1.45,.64,1); }\n" +
+    "#m-puffi.mask-down #pf-maskCup { transform: translateY(7.4px) rotate(-1deg); }\n" +
+    "#pf-umb { transform: translateY(15px); opacity: 0; transition: transform .65s cubic-bezier(.34,1.56,.64,1) .1s, opacity .3s ease .1s; }\n" +
+    "#m-puffi.umb-on #pf-umb { transform: translateY(0); opacity: 1; }\n" +
+    "#pf-brows { opacity: 0; transition: opacity .2s ease; }\n" +
+    "#pf-browL, #pf-browR { transform-box: fill-box; transform-origin: center; transition: transform .25s ease; }\n" +
+    "#m-puffi.brows-knit #pf-brows { opacity: 1; }\n" +
+    "#m-puffi.brows-knit #pf-browL { transform: rotate(16deg) translateY(.6px); }\n" +
+    "#m-puffi.brows-knit #pf-browR { transform: rotate(-16deg) translateY(.6px); }\n" +
+    "#pf-bags { opacity: 0; transition: opacity .6s ease; }\n" +
+    "#m-puffi.mood-stressed #pf-bags { opacity: .55; }\n" +
+    "#pf-blushDeep { opacity: 0; transition: opacity .25s ease; }\n" +
+    "#m-puffi.blush-deep #pf-blushDeep { opacity: .8; }\n" +
+    "#pf-yawnO { transform-origin: 35px 23.6px; transform: scale(0); }\n" +
+    "#pf-squint { opacity: 0; transition: opacity .12s ease; }\n" +
+    "#pf-cheeks .chk { transform-box: fill-box; transform-origin: center; transform: scale(0); }\n" +
+    "#m-puffi .streak, #m-puffi .fl, #m-puffi .fy { opacity: 0; }\n" +
+    "#m-puffi .streak { transform-box: view-box; }\n" +
+    "#m-puffi .fl, #m-puffi .fy { transform-box: fill-box; transform-origin: center; }\n" +
+    "\n/* ---- eyes ---- */\n" +
+    "#m-puffi.blink #pf-lids, #m-puffi.st-sleep #pf-lids, #m-puffi.eyes-closed #pf-lids { transform: scaleY(1); }\n" +
+    "#m-puffi.look-down #pf-pupils { animation: none; transform: translate(.7px, 1.9px); }\n" +
+    "#m-puffi.look-up #pf-pupils { animation: none; transform: translate(.5px, -2px); }\n" +
+    "#m-puffi.look-l #pf-pupils { animation: none; transform: translate(-1.4px, .2px); }\n" +
+    "#m-puffi.look-r #pf-pupils { animation: none; transform: translate(1.4px, .2px); }\n" +
+    "#m-puffi.squint #pf-pupils { opacity: 0; }\n" +
+    "#m-puffi.squint #pf-squint { opacity: 1; }\n" +
+    "#m-puffi.squint #pf-lids { transform: scaleY(0); }\n" +
+    "\n/* ---- strap twitch (idle micro-motion) ---- */\n" +
+    "#m-puffi.twitch #pf-strap { animation: pfStrapTwitch .6s ease-in-out; }\n" +
+    "\n/* ---- walk: floppy shuffle, the U-ends squash in turn ---- */\n" +
+    "#m-puffi.st-walk #pf-legL { animation: pfShuffle var(--step) ease-in-out infinite; }\n" +
+    "#m-puffi.st-walk #pf-legR { animation: pfShuffle var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -2); }\n" +
+    "#m-puffi.st-walk #pf-body { animation: pfSway var(--step) ease-in-out infinite; }\n" +
+    "#m-puffi.mood-stressed.st-walk #pf-body { animation-name: pfSwayStumble; }\n" +
+    "#m-puffi.st-walk #pf-root { animation: pfBobP calc(var(--step) / 2) ease-in-out infinite; }\n" +
+    "#m-puffi.st-walk #pf-face { animation: pfCounterP calc(var(--step) / 2) ease-in-out infinite; animation-delay: calc(var(--step) / -8); }\n" +
+    "#m-puffi.st-walk #pf-strap { animation: pfStrapWalk var(--step) ease-in-out infinite; animation-delay: calc(var(--step) / -6); }\n" +
+    "\n/* strap flutter on turn-around (after walk rules so it wins for its .65s) */\n" +
+    "#m-puffi.flutter #pf-strap { animation: pfStrapFlutter .65s ease-in-out; }\n" +
+    "\n/* ---- sit / sleep ---- */\n" +
+    "#m-puffi.pose-sit #pf-root { transform: translateY(3px); }\n" +
+    "#m-puffi.pose-sit #pf-legL, #m-puffi.pose-sit #pf-legR { transform: scale(1.1, .86); }\n" +
+    "#m-puffi.st-sleep #pf-root { transform: translateY(4.5px) rotate(-2.5deg); }\n" +
+    "#m-puffi.st-sleep #pf-breathe { animation: pfSnore 6s ease-in-out infinite; }\n" +
+    "\n/* ---- fx layer (outside .flip: glyphs never mirror) ---- */\n" +
+    "#m-puffi .fx { position: absolute; inset: 0; pointer-events: none; }\n" +
+    "#m-puffi .zz { position: absolute; top: -2px; opacity: 0; font: italic 700 11px/1 \"Trebuchet MS\", \"Segoe UI\", sans-serif; color: #F0FDFA; text-shadow: 0 1px 2px rgba(19,78,74,.7); }\n" +
+    "#m-puffi .z1 { left: 40px; }\n" +
+    "#m-puffi .z2 { left: 32px; font-size: 15px; }\n" +
+    "#m-puffi .z3 { left: 48px; }\n" +
+    "#m-puffi.st-sleep .z1 { animation: pfZ 2.9s ease-in-out infinite; }\n" +
+    "#m-puffi.st-sleep .z2 { animation: pfZ 2.9s ease-in-out .95s infinite; }\n" +
+    "#m-puffi.st-sleep .z3 { animation: pfZ 2.9s ease-in-out 1.9s infinite; }\n" +
+    "#m-puffi .cloud { position: absolute; top: -24px; left: 12px; padding: 2px 6px; border-radius: 8px; background: #F0FDFA; border: 1px solid rgba(15,118,110,.4); color: #0F766E; font: 700 10px/1.3 \"Trebuchet MS\", \"Segoe UI\", sans-serif; opacity: 0; }\n" +
+    "#m-puffi .cloud::after { content: \"\"; position: absolute; left: 5px; bottom: -6px; width: 4px; height: 4px; border-radius: 50%; background: #F0FDFA; border: 1px solid rgba(15,118,110,.4); }\n" +
+    "#m-puffi.st-cloudgaze .cloud { animation: pfCloud 4s ease-in-out; }\n" +
+    "#m-puffi .hx { position: absolute; top: 2px; opacity: 0; color: #FB7185; font: 700 10px/1 \"Trebuchet MS\", \"Segoe UI\", sans-serif; text-shadow: 0 1px 2px rgba(19,78,74,.5); }\n" +
+    "#m-puffi .h1 { left: 30px; }\n" +
+    "#m-puffi .h2 { left: 22px; font-size: 8px; }\n" +
+    "#m-puffi .h3 { left: 40px; font-size: 8px; }\n" +
+    "#m-puffi.st-snuggle .h1 { animation: pfHeart 2.2s ease-in-out infinite; }\n" +
+    "#m-puffi.st-snuggle .h2 { animation: pfHeart 2.2s ease-in-out .7s infinite; }\n" +
+    "#m-puffi.st-snuggle .h3 { animation: pfHeart 2.2s ease-in-out 1.4s infinite; }\n" +
+    "\n/* ---- state one-shots ---- */\n" +
+    "/* no arms: a wave is one lifted U-end and a lot of goodwill */\n" +
+    "#m-puffi.st-wave #pf-legR { transform-origin: 52px 32px; animation: pfWaveEnd 2.1s ease-in-out; }\n" +
+    "#m-puffi.st-wave #pf-root { transform: rotate(-6deg) translateX(-1px); }\n" +
+    "#m-puffi.st-jump .jumper { animation: pfJump 1.25s cubic-bezier(.4,0,.4,1); }\n" +
+    "#m-puffi.st-jump .shadow { animation: pfShadowJump 1.25s cubic-bezier(.4,0,.4,1); }\n" +
+    "/* stressed jump: low arc, oof landing */\n" +
+    "#m-puffi.mood-stressed.st-jump .jumper { animation-name: pfJumpLow; }\n" +
+    "#m-puffi.mood-stressed.st-jump .shadow { animation-name: pfShadowJumpLow; }\n" +
+    "#m-puffi.hop .jumper { animation: pfHop .55s ease-in-out; }\n" +
+    "#m-puffi.hop .shadow { animation: pfShadowHop .55s ease-in-out; }\n" +
+    "#m-puffi.st-stretch #pf-root { animation: pfStretchP 1.9s ease-in-out; }\n" +
+    "#m-puffi.st-stretch #pf-legL, #m-puffi.st-stretch #pf-legR { animation: pfStretchLeg 1.9s ease-in-out; }\n" +
+    "#m-puffi.st-stretch #pf-maskCup { animation: pfMaskJig 1.9s ease-in-out; }\n" +
+    "#m-puffi.st-inflate #pf-breathe { animation: pfInflate 3.5s ease-in-out; }\n" +
+    "#m-puffi.st-inflate .jumper { animation: pfPfft 3.5s ease-in-out; }\n" +
+    "#m-puffi.st-inflate .shadow { animation: pfShadowInflate 3.5s ease-in-out; }\n" +
+    "#m-puffi.st-inflate #pf-legL { animation: pfLegInL 3.5s ease-in-out; }\n" +
+    "#m-puffi.st-inflate #pf-legR { animation: pfLegInR 3.5s ease-in-out; }\n" +
+    "#m-puffi.st-inflate .chk { animation: pfCheeks 3.5s ease-in-out; }\n" +
+    "#m-puffi.st-yawn #pf-root { animation: pfYawnP 2.4s ease-in-out; }\n" +
+    "#m-puffi.st-yawn #pf-yawnO { animation: pfYawnMouth 2.4s ease-in-out; }\n" +
+    "#m-puffi.st-yawn #pf-mouthS { opacity: 0; }\n" +
+    "#m-puffi.st-rollover #pf-root { animation: pfRoll 4.6s ease-in-out; }\n" +
+    "#m-puffi.st-rollover .shadow { animation: pfShadowRoll 4.6s ease-in-out; }\n" +
+    "#m-puffi.st-cloudgaze #pf-root { transform: rotate(-3.5deg) translateY(.5px); }\n" +
+    "#m-puffi.st-grumble #pf-body { animation: pfGrumble 2.8s ease-in-out; }\n" +
+    "#m-puffi.st-snuggle #pf-legL { transform: translate(4.5px, -.5px) rotate(12deg); }\n" +
+    "#m-puffi.st-snuggle #pf-legR { transform: translate(-4.5px, -.5px) rotate(-12deg); }\n" +
+    "#m-puffi.st-snuggle #pf-body { animation: pfSnug 1.6s ease-in-out infinite; }\n" +
+    "#m-puffi.mood-bliss.st-idle #pf-body, #m-puffi.mood-bliss.st-sit #pf-body { animation: pfSwayBliss 3.8s ease-in-out infinite; }\n" +
+    "/* one U-end briefly loses tension, snaps back */\n" +
+    "#m-puffi.flopL #pf-legL { transform-origin: 18px 30px; animation: pfFlopL .95s ease-in-out; }\n" +
+    "#m-puffi.flopR #pf-legR { transform-origin: 52px 30px; animation: pfFlopR .95s ease-in-out; }\n" +
+    "/* stressed micro-shake, never while asleep */\n" +
+    "#m-puffi.mood-stressed #pf-jitter { animation: pfJitter .38s linear infinite; }\n" +
+    "#m-puffi.mood-stressed.st-sleep #pf-jitter { animation: none; }\n" +
+    "\n/* ---- fabric sheen sweeps ---- */\n" +
+    "#m-puffi.sh1 #pf-shineA { animation: pfSheen 1.05s ease-in-out; }\n" +
+    "#m-puffi.sh2 #pf-shineL { animation: pfSheen 1.05s ease-in-out; }\n" +
+    "\n/* ---- fluff puffs ---- */\n" +
+    "#m-puffi.fluff .fl { animation: pfFluff 1.7s ease-out; }\n" +
+    "#m-puffi.fluffY .fy { animation: pfFluffY 1.6s ease-out; }\n" +
+    "\n/* ---- keyframes ---- */\n" +
+    "@keyframes pfBreathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.035, 1.06); } }\n" +
+    "@keyframes pfSnore { 0%,100% { transform: scale(1); } 32% { transform: scale(1.05, 1.09); } 55% { transform: scale(1.008, 1.015); } 66% { transform: scale(1.012, 1.02); } 70% { transform: scale(1.06, 1.1); } 74% { transform: scale(1.02, 1.03); } }\n" +
+    "@keyframes pfDrift { 0%,100% { transform: translate(0,0); } 25% { transform: translate(.6px,.4px); } 55% { transform: translate(-.5px,.5px); } 80% { transform: translate(.2px,-.2px); } }\n" +
+    "@keyframes pfZ { 0% { opacity: 0; transform: translate(0, 5px) scale(.6); } 25% { opacity: .9; } 100% { opacity: 0; transform: translate(10px, -24px) scale(1.3); } }\n" +
+    "@keyframes pfShuffle { 0%,100% { transform: scale(1); } 50% { transform: scale(1.16, .8); } }\n" +
+    "@keyframes pfSway { 0%,100% { transform: rotate(4deg); } 50% { transform: rotate(-4deg); } }\n" +
+    "@keyframes pfSwayStumble { 0%,100% { transform: rotate(3.5deg); } 38% { transform: rotate(-4.5deg); } 52% { transform: rotate(-1.5deg); } 62% { transform: rotate(-5.5deg); } 82% { transform: rotate(2.5deg); } }\n" +
+    "@keyframes pfBobP { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-1.3px); } }\n" +
+    "@keyframes pfCounterP { 0%,100% { transform: translateY(0); } 50% { transform: translateY(.9px); } }\n" +
+    "@keyframes pfStrapIdle { 0%,100% { transform: rotate(-2.5deg); } 50% { transform: rotate(3deg); } }\n" +
+    "@keyframes pfStrapWalk { 0%,100% { transform: rotate(9deg); } 50% { transform: rotate(-12deg); } }\n" +
+    "@keyframes pfStrapTwitch { 0%,100% { transform: rotate(0); } 25% { transform: rotate(11deg); } 55% { transform: rotate(-8deg); } 80% { transform: rotate(4deg); } }\n" +
+    "@keyframes pfStrapFlutter { 0%,100% { transform: rotate(0); } 20% { transform: rotate(15deg); } 45% { transform: rotate(-12deg); } 70% { transform: rotate(7deg); } 88% { transform: rotate(-3deg); } }\n" +
+    "@keyframes pfJump { 0% { transform: translateY(0) scale(1); } 20% { transform: translateY(0) scale(1.14, .8); } 34% { transform: translateY(-8px) scale(.94, 1.1); } 54% { transform: translateY(-18px) scale(1, 1.04); } 72% { transform: translateY(-3px) scale(.99, 1.02); } 81% { transform: translateY(0) scale(1.18, .78); } 91% { transform: translateY(0) scale(.95, 1.05); } 100% { transform: translateY(0) scale(1); } }\n" +
+    "@keyframes pfShadowJump { 0% { transform: scale(1); opacity: .17; } 20% { transform: scale(1.1, 1); opacity: .21; } 54% { transform: scale(.62); opacity: .08; } 81% { transform: scale(1.2, 1); opacity: .23; } 100% { transform: scale(1); opacity: .17; } }\n" +
+    "@keyframes pfJumpLow { 0% { transform: translateY(0) scale(1); } 22% { transform: translateY(0) scale(1.16, .78); } 38% { transform: translateY(-5px) scale(.95, 1.07); } 55% { transform: translateY(-8px) scale(1, 1.02); } 70% { transform: translateY(-1px) scale(1, 1); } 78% { transform: translateY(0) scale(1.26, .68); } 87% { transform: translateY(0) scale(.92, 1.06); } 94% { transform: translateY(0) scale(1.06, .95); } 100% { transform: translateY(0) scale(1); } }\n" +
+    "@keyframes pfShadowJumpLow { 0% { transform: scale(1); opacity: .17; } 22% { transform: scale(1.12, 1); opacity: .21; } 55% { transform: scale(.85); opacity: .12; } 78% { transform: scale(1.28, 1); opacity: .24; } 100% { transform: scale(1); opacity: .17; } }\n" +
+    "@keyframes pfHop { 0% { transform: translateY(0) scale(1); } 30% { transform: translateY(0) scale(1.08, .88); } 60% { transform: translateY(-5px) scale(.97, 1.04); } 85% { transform: translateY(0) scale(1.06, .92); } 100% { transform: translateY(0) scale(1); } }\n" +
+    "@keyframes pfShadowHop { 0%,100% { transform: scale(1); opacity: .17; } 60% { transform: scale(.88); opacity: .13; } }\n" +
+    "@keyframes pfWaveEnd { 0%,100% { transform: rotate(0); } 14% { transform: rotate(-44deg); } 28% { transform: rotate(-28deg); } 42% { transform: rotate(-48deg); } 56% { transform: rotate(-28deg); } 70% { transform: rotate(-46deg); } 86% { transform: rotate(-8deg); } }\n" +
+    "@keyframes pfStretchP { 0% { transform: scale(1); } 24% { transform: scale(1.07, .9); } 52% { transform: scale(.94, 1.1); } 68% { transform: scale(.94, 1.11); } 84% { transform: scale(1.04, .95); } 100% { transform: scale(1); } }\n" +
+    "@keyframes pfStretchLeg { 0%,100% { transform: scaleY(1); } 52%,68% { transform: scaleY(1.06); } }\n" +
+    "@keyframes pfMaskJig { 0%,100% { transform: rotate(-7deg); } 55% { transform: rotate(-13deg) translateY(-.6px); } 75% { transform: rotate(-4deg); } }\n" +
+    "@keyframes pfInflate { 0% { transform: scale(1); } 8% { transform: scale(.94, .9); } 18% { transform: scale(1.22, 1.18); } 26% { transform: scale(1.25, 1.17) rotate(.8deg); } 32% { transform: scale(1.22, 1.2) rotate(-.8deg); } 38% { transform: scale(1.25, 1.18) rotate(.6deg); } 46% { transform: scale(1.23, 1.19) rotate(-.4deg); } 52% { transform: scale(1.24, 1.19); } 58% { transform: scale(.84, .8); } 66% { transform: scale(.78, .72); } 74% { transform: scale(1.18, .42); } 82% { transform: scale(1.14, .45); } 90% { transform: scale(.94, 1.08); } 96% { transform: scale(1.04, .96); } 100% { transform: scale(1); } }\n" +
+    "@keyframes pfPfft { 0%,50% { transform: translateX(0); } 60% { transform: translateX(3px); } 74% { transform: translateX(7px); } 86% { transform: translateX(6px); } 100% { transform: translateX(0); } }\n" +
+    "@keyframes pfShadowInflate { 0%,100% { transform: scale(1); opacity: .17; } 20% { transform: scale(1.16, 1); opacity: .2; } 52% { transform: scale(1.18, 1); opacity: .2; } 64% { transform: scale(.88, 1); opacity: .15; } 76% { transform: scale(1.32, 1); opacity: .24; } 88% { transform: scale(.96, 1); } }\n" +
+    "@keyframes pfLegInL { 0%,100% { transform: translateX(0); } 10% { transform: translateX(-1.5px); } 20% { transform: translateX(5.5px); } 52% { transform: translateX(6px); } 62% { transform: translateX(1px); } 76% { transform: translateX(-2.5px); } 88% { transform: translateX(.5px); } }\n" +
+    "@keyframes pfLegInR { 0%,100% { transform: translateX(0); } 10% { transform: translateX(1.5px); } 20% { transform: translateX(-5.5px); } 52% { transform: translateX(-6px); } 62% { transform: translateX(-1px); } 76% { transform: translateX(2.5px); } 88% { transform: translateX(-.5px); } }\n" +
+    "@keyframes pfCheeks { 0%,16%,60%,100% { transform: scale(0); } 24% { transform: scale(1.15); } 32% { transform: scale(.95); } 44% { transform: scale(1.08); } 54% { transform: scale(1); } }\n" +
+    "@keyframes pfYawnP { 0%,100% { transform: scale(1) rotate(0); } 22% { transform: scale(1.02, .96) rotate(1deg); } 46% { transform: scale(.97, 1.06) rotate(-3deg); } 66% { transform: scale(.97, 1.05) rotate(-2.5deg); } 82% { transform: scale(1.01, .99) rotate(1.2deg); } 86% { transform: scale(1) rotate(-1.2deg); } 90% { transform: scale(1) rotate(.8deg); } 94% { transform: scale(1) rotate(-.4deg); } }\n" +
+    "@keyframes pfYawnMouth { 0%,100% { transform: scale(0); } 18% { transform: scale(1.15); } 28% { transform: scale(.95); } 40% { transform: scale(1.05); } 62% { transform: scale(1); } 80% { transform: scale(.4); } 88% { transform: scale(0); } }\n" +
+    "@keyframes pfRoll { 0% { transform: rotate(0); } 6% { transform: rotate(-6deg); } 14% { transform: rotate(97deg); } 18% { transform: rotate(90deg); } 24% { transform: rotate(86deg); } 28% { transform: rotate(94deg); } 33% { transform: rotate(88deg); } 38% { transform: rotate(72deg); } 44% { transform: rotate(93deg); } 50% { transform: rotate(58deg); } 57% { transform: rotate(95deg); } 65% { transform: rotate(90deg); } 72% { transform: rotate(38deg); } 78% { transform: rotate(-8deg); } 84% { transform: rotate(4deg); } 90% { transform: rotate(-2deg); } 100% { transform: rotate(0); } }\n" +
+    "@keyframes pfShadowRoll { 0%,100% { transform: scale(1); opacity: .17; } 14% { transform: scaleX(.6); opacity: .22; } 60% { transform: scaleX(.6); opacity: .22; } 78% { transform: scaleX(1.12); opacity: .2; } }\n" +
+    "@keyframes pfGrumble { 0%,100% { transform: rotate(0) scale(1); } 6% { transform: rotate(1.6deg) scale(1.005, .995); } 12% { transform: rotate(-1.6deg) scale(1); } 18% { transform: rotate(1.4deg) scale(1.01, .99); } 24% { transform: rotate(-1.4deg) scale(1); } 30% { transform: rotate(1.1deg) scale(1.008, .992); } 36% { transform: rotate(-1.1deg) scale(1); } 42% { transform: rotate(.7deg) scale(1); } 50% { transform: rotate(0) scale(1); } 62% { transform: scale(1.045, 1.05); } 80% { transform: scale(1.015, .945); } 92% { transform: scale(.99, .975); } }\n" +
+    "@keyframes pfSnug { 0%,100% { transform: scale(1.025, .975); } 50% { transform: scale(.975, 1.03); } }\n" +
+    "@keyframes pfSwayBliss { 0%,100% { transform: rotate(1.8deg); } 50% { transform: rotate(-1.8deg); } }\n" +
+    "@keyframes pfHeart { 0% { opacity: 0; transform: translateY(2px) scale(.5); } 25% { opacity: .9; } 100% { opacity: 0; transform: translateY(-15px) scale(1.15); } }\n" +
+    "@keyframes pfCloud { 0% { opacity: 0; transform: translateY(4px) scale(.7); } 16% { opacity: .95; transform: translateY(0) scale(1); } 72% { opacity: .95; transform: translateY(-3px) scale(1); } 100% { opacity: 0; transform: translateY(-7px) scale(1); } }\n" +
+    "@keyframes pfFluff { 0% { opacity: 0; transform: translate(0,0) scale(.4) rotate(0); } 22% { opacity: .75; transform: translate(0,-3px) scale(.9); } 100% { opacity: 0; transform: translate(var(--fx), var(--fy)) scale(1.1) rotate(var(--fr)); } }\n" +
+    "@keyframes pfFluffY { 0% { opacity: 0; transform: translate(0,0) scale(.3) rotate(0); } 15% { opacity: .8; } 60% { transform: translate(4px,-10px) scale(1) rotate(30deg); } 100% { opacity: 0; transform: translate(7px,-6px) scale(1.05) rotate(50deg); } }\n" +
+    "@keyframes pfSheen { 0% { opacity: 0; transform: translateX(-8px); } 25% { opacity: .3; } 100% { opacity: 0; transform: translateX(12px); } }\n" +
+    "@keyframes pfJitter { 0%,100% { transform: translate(0,0); } 25% { transform: translate(.4px,-.2px); } 50% { transform: translate(-.4px,.15px); } 75% { transform: translate(.3px,.2px); } }\n" +
+    "@keyframes pfFlopL { 0%,100% { transform: rotate(0); } 28% { transform: rotate(-8.5deg); } 46% { transform: rotate(-9.5deg); } 62% { transform: rotate(2.5deg); } 78% { transform: rotate(-1.5deg); } }\n" +
+    "@keyframes pfFlopR { 0%,100% { transform: rotate(0); } 28% { transform: rotate(8.5deg); } 46% { transform: rotate(9.5deg); } 62% { transform: rotate(-2.5deg); } 78% { transform: rotate(1.5deg); } }\n" +
+    "\n/* ---- reduced motion: the cutest static frame is the nap ---- */\n" +
+    "@media (prefers-reduced-motion: reduce) { #m-puffi *, #m-puffi *::before, #m-puffi *::after { animation: none !important; transition: none !important; } }\n";
+
+  var SVG = "" +
+    "<svg class=\"char\" id=\"pf-char\" width=\"70\" height=\"64\" viewBox=\"0 0 70 64\" aria-hidden=\"true\" xmlns=\"http://www.w3.org/2000/svg\">\n" +
+    "<title>Puffi the neck pillow</title>\n" +
+    "<defs>\n" +
+    "  <clipPath id=\"pf-cpShA\"><rect x=\"15\" y=\"7.5\" width=\"15\" height=\"9\" rx=\"4.5\" transform=\"rotate(-14 22.5 12)\"/></clipPath>\n" +
+    "  <clipPath id=\"pf-cpShL\"><rect x=\"46.5\" y=\"38\" width=\"11\" height=\"14\" rx=\"5\"/></clipPath>\n" +
+    "</defs>\n" +
+    "<g id=\"pf-root\">\n" +
+    "<g id=\"pf-jitter\">\n" +
+    "<g id=\"pf-breathe\">\n" +
+    "<g id=\"pf-body\">\n" +
+    "  <!-- the two ends of the U: they are the feet -->\n" +
+    "  <g id=\"pf-legL\">\n" +
+    "    <rect x=\"11\" y=\"26\" width=\"14\" height=\"34\" rx=\"6.5\" fill=\"#5EEAD4\" stroke=\"#0F766E\" stroke-width=\"1.4\" stroke-linejoin=\"round\"/>\n" +
+    "    <ellipse cx=\"18\" cy=\"58.6\" rx=\"5.6\" ry=\"1.9\" fill=\"#2DD4BF\" stroke=\"#0F766E\" stroke-width=\".7\"/>\n" +
+    "    <line x1=\"14.2\" y1=\"33\" x2=\"14.2\" y2=\"52\" stroke=\"#F0FDFA\" stroke-width=\".7\" stroke-dasharray=\"1.6 1.8\" opacity=\".8\"/>\n" +
+    "    <g id=\"pf-patch\" transform=\"rotate(-9 18.4 45)\">\n" +
+    "      <circle cx=\"18.4\" cy=\"45\" r=\"3.7\" fill=\"none\" stroke=\"#F0FDFA\" stroke-width=\".5\" stroke-dasharray=\"1.2 1.4\" opacity=\".9\"/>\n" +
+    "      <path d=\"M18.4,47.4 C16,45.5 15.2,43.8 16.4,42.7 C17.3,41.9 18.4,42.5 18.4,43.3 C18.4,42.5 19.5,41.9 20.4,42.7 C21.6,43.8 20.8,45.5 18.4,47.4 Z\" fill=\"#FDA4AF\" stroke=\"#E11D48\" stroke-width=\".6\" stroke-linejoin=\"round\"/>\n" +
+    "    </g>\n" +
+    "  </g>\n" +
+    "  <g id=\"pf-legR\">\n" +
+    "    <rect x=\"45\" y=\"26\" width=\"14\" height=\"34\" rx=\"6.5\" fill=\"#5EEAD4\" stroke=\"#0F766E\" stroke-width=\"1.4\" stroke-linejoin=\"round\"/>\n" +
+    "    <ellipse cx=\"52\" cy=\"58.6\" rx=\"5.6\" ry=\"1.9\" fill=\"#2DD4BF\" stroke=\"#0F766E\" stroke-width=\".7\"/>\n" +
+    "    <line x1=\"55.8\" y1=\"33\" x2=\"55.8\" y2=\"52\" stroke=\"#F0FDFA\" stroke-width=\".7\" stroke-dasharray=\"1.6 1.8\" opacity=\".8\"/>\n" +
+    "    <g clip-path=\"url(#pf-cpShL)\"><g id=\"pf-shineL\" class=\"streak\">\n" +
+    "      <rect x=\"49.5\" y=\"36\" width=\"2.2\" height=\"18\" fill=\"#FFFFFF\" transform=\"rotate(18 50.6 45)\"/>\n" +
+    "    </g></g>\n" +
+    "  </g>\n" +
+    "  <!-- cocktail umbrella tucked into the U: only comes out on vacation -->\n" +
+    "  <g id=\"pf-umb\">\n" +
+    "    <line x1=\"37.2\" y1=\"34.5\" x2=\"41.6\" y2=\"56\" stroke=\"#B45309\" stroke-width=\"1.1\" stroke-linecap=\"round\"/>\n" +
+    "    <path d=\"M30.2,42.6 Q32,32.6 36.9,31.8 Q41.8,32.6 43.6,42.6 Q41.9,41.2 40.2,42.4 Q38.5,41 36.9,42.4 Q35.3,41 33.6,42.4 Q31.9,41.2 30.2,42.6 Z\" fill=\"#FDA4AF\" stroke=\"#E11D48\" stroke-width=\".7\" stroke-linejoin=\"round\"/>\n" +
+    "    <line x1=\"36.9\" y1=\"32.2\" x2=\"36.9\" y2=\"42\" stroke=\"#E11D48\" stroke-width=\".5\"/>\n" +
+    "    <circle cx=\"36.9\" cy=\"31.6\" r=\".8\" fill=\"#E11D48\"/>\n" +
+    "  </g>\n" +
+    "  <!-- the arch: the face lives here, seams are load-bearing charm -->\n" +
+    "  <g id=\"pf-arch\">\n" +
+    "    <path d=\"M11,33.5 L11,24 Q11,5.5 35,5.5 Q59,5.5 59,24 L59,33.5 Q59,36 56.5,36 L47.8,36 Q45.4,36 45.4,33 Q45.4,26.8 35,26.8 Q24.6,26.8 24.6,33 Q24.6,36 22.2,36 L13.5,36 Q11,36 11,33.5 Z\" fill=\"#5EEAD4\" stroke=\"#0F766E\" stroke-width=\"1.5\" stroke-linejoin=\"round\"/>\n" +
+    "    <path d=\"M13.6,25 Q13.6,8 35,8 Q56.4,8 56.4,25\" fill=\"none\" stroke=\"#F0FDFA\" stroke-width=\".7\" stroke-dasharray=\"1.7 1.9\" opacity=\".8\"/>\n" +
+    "    <line x1=\"12.5\" y1=\"34.8\" x2=\"23.5\" y2=\"34.8\" stroke=\"#F0FDFA\" stroke-width=\".7\" stroke-dasharray=\"1.5 1.7\" opacity=\".8\"/>\n" +
+    "    <line x1=\"46.5\" y1=\"34.8\" x2=\"57.5\" y2=\"34.8\" stroke=\"#F0FDFA\" stroke-width=\".7\" stroke-dasharray=\"1.5 1.7\" opacity=\".8\"/>\n" +
+    "    <path d=\"M15.5,20.5 Q16.5,10.5 26,8.8\" stroke=\"#99F6E4\" stroke-width=\"2.2\" fill=\"none\" opacity=\".5\" stroke-linecap=\"round\"/>\n" +
+    "    <g clip-path=\"url(#pf-cpShA)\"><g id=\"pf-shineA\" class=\"streak\">\n" +
+    "      <rect x=\"20\" y=\"5.5\" width=\"2.4\" height=\"13\" fill=\"#FFFFFF\" transform=\"rotate(20 21.2 12)\"/>\n" +
+    "    </g></g>\n" +
+    "  </g>\n" +
+    "  <!-- blowfish cheeks: only exist while holding air -->\n" +
+    "  <g id=\"pf-cheeks\">\n" +
+    "    <circle class=\"chk\" cx=\"23\" cy=\"19\" r=\"4.1\" fill=\"#99F6E4\" stroke=\"#0F766E\" stroke-width=\".8\"/>\n" +
+    "    <circle class=\"chk\" cx=\"47\" cy=\"19\" r=\"4.1\" fill=\"#99F6E4\" stroke=\"#0F766E\" stroke-width=\".8\"/>\n" +
+    "  </g>\n" +
+    "  <g id=\"pf-face\">\n" +
+    "    <g id=\"pf-bags\">\n" +
+    "      <path d=\"M27,21.9 Q29.8,23.7 32.6,21.9\" fill=\"none\" stroke=\"#115E59\" stroke-width=\".9\" stroke-linecap=\"round\"/>\n" +
+    "      <path d=\"M37.4,21.9 Q40.2,23.7 43,21.9\" fill=\"none\" stroke=\"#115E59\" stroke-width=\".9\" stroke-linecap=\"round\"/>\n" +
+    "    </g>\n" +
+    "    <ellipse cx=\"29.8\" cy=\"17.2\" rx=\"3.6\" ry=\"4\" fill=\"#FFFFFF\" stroke=\"#134E4A\" stroke-width=\"1\"/>\n" +
+    "    <ellipse cx=\"40.2\" cy=\"17.2\" rx=\"3.6\" ry=\"4\" fill=\"#FFFFFF\" stroke=\"#134E4A\" stroke-width=\"1\"/>\n" +
+    "    <g id=\"pf-pupils\">\n" +
+    "      <circle cx=\"30.4\" cy=\"17.7\" r=\"1.8\" fill=\"#134E4A\"/>\n" +
+    "      <circle cx=\"40.8\" cy=\"17.7\" r=\"1.8\" fill=\"#134E4A\"/>\n" +
+    "      <circle cx=\"31\" cy=\"16.9\" r=\".6\" fill=\"#FFFFFF\"/>\n" +
+    "      <circle cx=\"41.4\" cy=\"16.9\" r=\".6\" fill=\"#FFFFFF\"/>\n" +
+    "    </g>\n" +
+    "    <g id=\"pf-lids\">\n" +
+    "      <rect x=\"26\" y=\"13\" width=\"7.6\" height=\"8.6\" rx=\"3.8\" fill=\"#5EEAD4\" stroke=\"#0F766E\" stroke-width=\".6\"/>\n" +
+    "      <rect x=\"36.4\" y=\"13\" width=\"7.6\" height=\"8.6\" rx=\"3.8\" fill=\"#5EEAD4\" stroke=\"#0F766E\" stroke-width=\".6\"/>\n" +
+    "    </g>\n" +
+    "    <g id=\"pf-brows\">\n" +
+    "      <path id=\"pf-browL\" d=\"M27.2,11.6 Q29.8,10.4 32.4,11.4\" fill=\"none\" stroke=\"#0F766E\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n" +
+    "      <path id=\"pf-browR\" d=\"M37.6,11.4 Q40.2,10.4 42.8,11.6\" fill=\"none\" stroke=\"#0F766E\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n" +
+    "    </g>\n" +
+    "    <g id=\"pf-squint\">\n" +
+    "      <path d=\"M27,18.3 Q29.8,15.4 32.6,18.3\" fill=\"none\" stroke=\"#134E4A\" stroke-width=\"1.4\" stroke-linecap=\"round\"/>\n" +
+    "      <path d=\"M37.4,18.3 Q40.2,15.4 43,18.3\" fill=\"none\" stroke=\"#134E4A\" stroke-width=\"1.4\" stroke-linecap=\"round\"/>\n" +
+    "    </g>\n" +
+    "    <g id=\"pf-mouth\">\n" +
+    "      <path id=\"pf-mouthS\" d=\"M32.9,23.2 Q35,25 37.1,23.2\" fill=\"none\" stroke=\"#134E4A\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n" +
+    "      <g id=\"pf-yawnO\">\n" +
+    "        <ellipse cx=\"35\" cy=\"23.6\" rx=\"2.8\" ry=\"2.7\" fill=\"#134E4A\" stroke=\"#0F766E\" stroke-width=\".5\"/>\n" +
+    "        <path d=\"M33.4,24.9 Q35,26.2 36.6,24.9 Q36.6,23.8 35,23.8 Q33.4,23.8 33.4,24.9 Z\" fill=\"#FDA4AF\"/>\n" +
+    "      </g>\n" +
+    "    </g>\n" +
+    "    <ellipse cx=\"25.4\" cy=\"21.3\" rx=\"1.9\" ry=\"1.1\" fill=\"#F9A8D4\" opacity=\".55\"/>\n" +
+    "    <ellipse cx=\"44.6\" cy=\"21.3\" rx=\"1.9\" ry=\"1.1\" fill=\"#F9A8D4\" opacity=\".55\"/>\n" +
+    "    <g id=\"pf-blushDeep\">\n" +
+    "      <ellipse cx=\"25.4\" cy=\"21.3\" rx=\"2.4\" ry=\"1.4\" fill=\"#FB7185\"/>\n" +
+    "      <ellipse cx=\"44.6\" cy=\"21.3\" rx=\"2.4\" ry=\"1.4\" fill=\"#FB7185\"/>\n" +
+    "    </g>\n" +
+    "  </g>\n" +
+    "  <!-- sleep mask: parked on the forehead, slides down for naps -->\n" +
+    "  <g id=\"pf-mask\">\n" +
+    "    <path d=\"M25.7,11.6 Q17.5,12.6 12.8,17.8\" fill=\"none\" stroke=\"#A78BFA\" stroke-width=\"1.1\"/>\n" +
+    "    <path d=\"M44.3,11.6 Q52.5,12.6 57.2,17.8\" fill=\"none\" stroke=\"#A78BFA\" stroke-width=\"1.1\"/>\n" +
+    "    <g id=\"pf-maskCup\">\n" +
+    "      <rect x=\"25.5\" y=\"7.6\" width=\"19\" height=\"8.2\" rx=\"4\" fill=\"#C4B5FD\" stroke=\"#7C3AED\" stroke-width=\"1\" stroke-linejoin=\"round\"/>\n" +
+    "      <path d=\"M31.9,9.3 A2.6,2.6 0 1 0 34.4,12.9 A2.1,2.1 0 0 1 31.9,9.3 Z\" fill=\"#F0FDFA\" opacity=\".95\"/>\n" +
+    "      <circle cx=\"38.6\" cy=\"10.3\" r=\".55\" fill=\"#F0FDFA\"/>\n" +
+    "      <circle cx=\"40.8\" cy=\"13.2\" r=\".5\" fill=\"#F0FDFA\"/>\n" +
+    "      <path d=\"M41.3,9.2 l.4,.9 .9,.4 -.9,.4 -.4,.9 -.4,-.9 -.9,-.4 .9,-.4 Z\" fill=\"#F0FDFA\"/>\n" +
+    "    </g>\n" +
+    "  </g>\n" +
+    "  <!-- snap-button strap: Puffi's answer to a luggage tag -->\n" +
+    "  <g id=\"pf-strap\">\n" +
+    "    <path d=\"M58.6,25.5 Q59.8,27 59.5,28.6\" fill=\"none\" stroke=\"#0F766E\" stroke-width=\".8\"/>\n" +
+    "    <rect x=\"57.7\" y=\"28.4\" width=\"3.4\" height=\"8.4\" rx=\"1.5\" fill=\"#F0FDFA\" stroke=\"#0F766E\" stroke-width=\".8\"/>\n" +
+    "    <line x1=\"59.4\" y1=\"30\" x2=\"59.4\" y2=\"34.6\" stroke=\"#99F6E4\" stroke-width=\".6\" stroke-dasharray=\"1 1.2\"/>\n" +
+    "    <circle cx=\"59.4\" cy=\"38.2\" r=\"1.9\" fill=\"#C4B5FD\" stroke=\"#7C3AED\" stroke-width=\".8\"/>\n" +
+    "    <circle cx=\"59.4\" cy=\"38.2\" r=\".6\" fill=\"#7C3AED\"/>\n" +
+    "  </g>\n" +
+    "</g>\n" +
+    "</g>\n" +
+    "</g>\n" +
+    "</g>\n" +
+    "<!-- fluff puffs at foot level (outside the airborne groups) -->\n" +
+    "<g id=\"pf-fluffG\">\n" +
+    "  <circle class=\"fl\" cx=\"18\" cy=\"57.5\" r=\"1.5\" fill=\"#F0FDFA\" style=\"--fx:-8px;--fy:2px;--fr:-70deg\"/>\n" +
+    "  <circle class=\"fl\" cx=\"52\" cy=\"57.5\" r=\"1.4\" fill=\"#CCFBF1\" style=\"--fx:8px;--fy:1px;--fr:80deg\"/>\n" +
+    "  <path class=\"fl\" d=\"M32,57.2 q2,-1.8 4,0 q-2,1.8 -4,0 Z\" fill=\"#99F6E4\" style=\"--fx:-3px;--fy:-3px;--fr:120deg\"/>\n" +
+    "  <circle class=\"fl\" cx=\"41\" cy=\"58.2\" r=\"1.1\" fill=\"#F0FDFA\" style=\"--fx:4px;--fy:-2px;--fr:-90deg\"/>\n" +
+    "</g>\n" +
+    "<!-- one wisp that escapes during the yawn -->\n" +
+    "<g id=\"pf-fluffY\">\n" +
+    "  <path class=\"fy\" d=\"M36.5,23.5 q2.2,-1.5 3.8,.4 q-2.2,1.5 -3.8,-.4 Z\" fill=\"#F0FDFA\" stroke=\"#99F6E4\" stroke-width=\".4\"/>\n" +
+    "</g>\n" +
+    "</svg>";
+
+  var SHADOW = "<svg class=\"shadow\" id=\"pf-shadow\" width=\"64\" height=\"10\" viewBox=\"0 0 64 10\" aria-hidden=\"true\"><ellipse cx=\"32\" cy=\"5\" rx=\"28\" ry=\"4\" fill=\"#000\"/></svg>";
+
+  var FX = "<div class=\"fx\" id=\"pf-fx\">" +
+    "<span class=\"zz z1\">z</span>" +
+    "<span class=\"zz z2\">Z</span>" +
+    "<span class=\"zz z3\">z</span>" +
+    "<div class=\"cloud\">✈</div>" +
+    "<span class=\"hx h1\">♥</span>" +
+    "<span class=\"hx h2\">♥</span>" +
+    "<span class=\"hx h3\">♥</span>" +
+    "</div>";
+
+  // strap micro-motion + landing fluff, shared by several states
+  function twitchStrap(k) { k.addC('twitch'); k.later(function () { k.remC('twitch'); }, 640); }
+  function fluffGround(k) { k.pulse('fluff', 1800); }
+
+  TrekMascots.register({
+    id: 'puffi',
+    name: 'Puffi',
+    tagline: 'the neck pillow — five more minutes',
+    width: 70,
+    height: 64,
+    css: CSS,
+    svg: SVG,
+    shadow: SHADOW,
+    fx: FX,
+    moods: ['rested', 'uneasy', 'stressed', 'bliss'],
+    reducedPose: 'pose-sit mask-down eyes-closed',
+    signature: 'inflate',
+    shineClasses: ['sh1', 'sh2'],
+    stateClasses: ['st-walk', 'st-idle', 'st-sit', 'st-sleep', 'st-stretch', 'st-wave', 'st-jump',
+      'st-inflate', 'st-yawn', 'st-rollover', 'st-cloudgaze', 'st-grumble', 'st-snuggle',
+      'pose-sit', 'mask-down',
+      'look-down', 'look-up', 'look-l', 'look-r', 'eyes-closed', 'squint', 'hop',
+      'twitch', 'flutter', 'flopL', 'flopR', 'blush-deep', 'brows-knit', 'fluff', 'fluffY'],
+    afterState: { sleep: 'stretch', stretch: 'idle', rollover: 'idle' },
+    glide: null,
+    blinkMs: 200,
+    blinkEvery: [3000, 7000],
+    config: {
+      turnPad: 20,
+      edgeSnap: 34,
+      speed: { rested: 16, uneasy: 14, stressed: 26, bliss: 12 },
+      step:  { rested: '0.95s', uneasy: '1.05s', stressed: '0.6s', bliss: '1.1s' },
+      waveEveryMs: 150000,
+      dur: {
+        walk: [3200, 8000], idle: [2200, 4600], sit: [4000, 9000], sleep: [9000, 16000],
+        stretch: [1950, 1950], wave: [2200, 2200], jump: [1300, 1300],
+        inflate: [3600, 3600], yawn: [2500, 2500], rollover: [4700, 4700],
+        cloudgaze: [4100, 4100], grumble: [2900, 2900], snuggle: [3800, 5200]
+      },
+      weights: {
+        rested:   { walk: 5,   idle: 4,   sit: 3.4, yawn: 2.4, cloudgaze: 1.6, snuggle: .8,  inflate: .5,  jump: .5, wave: .5, rollover: .35, grumble: .2 },
+        uneasy:   { walk: 4,   idle: 3.6, sit: 4.2, yawn: 3.6, cloudgaze: .8,  snuggle: .6,  inflate: .45, jump: .3, wave: .3, rollover: .5,  grumble: 1.1 },
+        stressed: { walk: 6.5, idle: 2.6, sit: 1.4, yawn: 1.6, cloudgaze: .2,  snuggle: .1,  inflate: .3,  jump: .9, wave: .2, rollover: .7,  grumble: 3.2 },
+        bliss:    { walk: 3,   idle: 3.4, sit: 4.4, yawn: 2.2, cloudgaze: 1.4, snuggle: 2.2, inflate: .7,  jump: .5, wave: .7, rollover: .3,  grumble: 0 }
+      },
+      sleepFromSit: { rested: 3.4, uneasy: 4.4, stressed: .05, bliss: 5.5 }
+    },
+
+    onTurn: function (k) { k.pulse('flutter', 680); },   // strap flutters on turn-around
+    moodFromTrip: function (days, ongoing) {
+      if (ongoing === true) return 'bliss';
+      if (days !== null && days >= 0 && days <= 7) return 'stressed';
+      if (days !== null && days > 7 && days <= 14) return 'uneasy';
+      return 'rested';
+    },
+    onMood: function (k, m, changed) {
+      if (m === 'bliss') {
+        if (!k._umbOn) {
+          k._umbOn = true;
+          setTimeout(function () { if (k._umbOn) k.addC('umb-on'); }, 900);
+        }
+      } else if (k._umbOn) {
+        k._umbOn = false;
+        k.remC('umb-on');
+      }
+      if (changed && m === 'stressed' && !TrekMascots.reduced && (k.state === 'sleep' || k.state === 'sit')) {
+        k.setState(k.state === 'sleep' ? 'stretch' : 'grumble'); // no time for napping
+      }
+    },
+    ambient: function (k) {
+      // one U-end loses tension every so often; a pillow's version of an ear flick
+      (function flopLoop() {
+        setTimeout(function () {
+          if (k.dead) return;
+          if (k.state === 'idle') k.pulse(Math.random() < .5 ? 'flopL' : 'flopR', 1000);
+          flopLoop();
+        }, k.rand(13000, 28000));
+      })();
+    },
+
+    enter: {
+      walk: function (k) { if (Math.random() < .25) k.setDir(-k.dir); },
+      idle: function (k) {
+        if (k.mood === 'bliss' && Math.random() < .6) k.addC('squint');
+        if (Math.random() < .7) k.later(function () {
+          k.addC(Math.random() < .5 ? 'look-l' : 'look-r');
+          k.later(function () { k.remC('look-l'); k.remC('look-r'); }, k.rand(700, 1300));
+        }, k.rand(400, 1600));
+        if (Math.random() < (k.mood === 'uneasy' ? .85 : .45)) k.later(function () { twitchStrap(k); }, k.rand(700, 2400));
+      },
+      sit: function (k) {
+        k.addC('pose-sit');
+        if (k.mood === 'bliss' && Math.random() < .7) k.addC('squint');
+        if (Math.random() < (k.mood === 'uneasy' ? .8 : .4)) k.later(function () { twitchStrap(k); }, k.rand(1200, 3600));
+        if (Math.random() < .45) k.later(function () {
+          k.addC('look-down');
+          k.later(function () { k.remC('look-down'); }, k.rand(900, 1500));
+        }, k.rand(600, 1800));
+      },
+      sleep: function (k) {
+        k.addC('pose-sit');
+        k.later(function () { k.addC('mask-down'); }, 420);
+      },
+      stretch: function (k) { k.addC('eyes-closed'); k.later(function () { k.remC('eyes-closed'); }, 800); },
+      wave: function (k) {
+        k.lastWave = performance.now();
+        k.later(function () { k.addC('squint'); }, 500);
+        if (k.mood === 'bliss') {
+          k.later(function () { k.addC('hop'); }, 1300);
+          k.later(function () { k.remC('hop'); }, 1900);
+        }
+        k.later(function () { k.remC('squint'); }, 1800);
+      },
+      jump: function (k) {
+        if (k.mood === 'stressed') {
+          // low panic hop: braces, lands with an oof
+          k.later(function () { k.addC('eyes-closed'); }, 700);
+          k.later(function () { k.remC('eyes-closed'); fluffGround(k); }, 1000);
+        } else {
+          k.later(function () { k.addC('squint'); }, 450);
+          k.later(function () { k.remC('squint'); }, 950);
+          k.later(function () { fluffGround(k); }, 1010);   // fluff on landing
+        }
+      },
+      // signature move: the Blowfish — puff up, hold it, lose it, flop, bounce back
+      inflate: function (k) {
+        k.later(function () { k.addC('eyes-closed'); }, 550);
+        k.later(function () { k.remC('eyes-closed'); }, 1900);  // air escapes, eyes pop open
+        k.later(function () { fluffGround(k); }, 2560);         // the flop
+        k.later(function () { k.addC('squint'); }, 3150);       // no harm done
+      },
+      yawn: function (k) {
+        k.later(function () { k.addC('eyes-closed'); }, 480);
+        k.later(function () { k.pulse('fluffY', 1700); }, 950); // one wisp escapes
+        k.later(function () { k.remC('eyes-closed'); }, 1950);
+      },
+      // tips onto his side, two honest attempts, rights himself, pretends it never happened
+      rollover: function (k) {
+        k.later(function () { fluffGround(k); }, 660);          // side impact
+        k.later(function () { k.addC('look-l'); }, 950);
+        k.later(function () { k.remC('look-l'); k.addC('look-r'); }, 1320);
+        k.later(function () { k.remC('look-r'); }, 1650);
+        k.later(function () { k.addC('eyes-closed'); }, 1720);  // effort
+        k.later(function () { k.remC('eyes-closed'); }, 2700);
+        k.later(function () { k.addC('blush-deep'); }, 3650);   // nobody saw that
+        k.later(function () { k.addC('look-r'); }, 3850);
+        k.later(function () { k.remC('look-r'); k.addC('look-l'); }, 4250);
+      },
+      cloudgaze: function (k) {
+        k.later(function () { k.addC('look-up'); }, 250);
+        k.later(function () { k.addC('squint'); }, 2700);
+        k.later(function () { k.remC('squint'); k.remC('look-up'); }, 3850);
+      },
+      grumble: function (k) {
+        k.later(function () { k.addC('brows-knit'); }, 120);
+        k.later(function () { k.addC('look-l'); }, 420);
+        k.later(function () { k.remC('look-l'); k.addC('look-r'); }, 920);
+        k.later(function () { k.remC('look-r'); }, 1360);
+        k.later(function () { k.remC('brows-knit'); k.addC('eyes-closed'); }, 1750); // the resigned sigh
+        k.later(function () { k.remC('eyes-closed'); }, 2620);
+      },
+      snuggle: function (k) {
+        k.addC('squint');
+        if (Math.random() < .5) k.later(function () { twitchStrap(k); }, k.rand(1500, 3000));
+      }
+    }
+  });
+})();
+</script>
+<!-- director.js -->
+<script>
+// Duet director — choreographs two mascots sharing the strip. The engine keeps
+// both fully autonomous; every 1.5–4 minutes the director waits for a calm
+// moment, freezes both FSMs (hold), plays one scene start-to-finish and hands
+// control back (release). Scenes are built ONLY from the shared contract
+// classes (wave/hop/squint/look-*) plus a few character-specific states, so a
+// missing partner ability simply removes the scene from the deck.
+(function () {
+  'use strict';
+
+  var rand = TrekMascots.rand;
+
+  // states we may interrupt to start a scene — never mid-air, mid-roll, mid-stamp
+  var CALM = { idle: 1, walk: 1, sit: 1 };
+
+  function has(k, state) { return !!k.def.enter[state] || k.def.stateClasses.indexOf('st-' + state) >= 0; }
+  function byId(a, b, id) { return a.def.id === id ? a : (b.def.id === id ? b : null); }
+
+  function spark(stageFx, x, glyph) {
+    var s = document.createElement('span');
+    s.textContent = glyph || '✦';
+    s.style.left = Math.round(x) + 'px';
+    stageFx.appendChild(s);
+    setTimeout(function () { if (s.parentNode) s.parentNode.removeChild(s); }, 1100);
+  }
+
+  /** walk both to a shared spot, facing each other; done() once both arrive */
+  function meet(a, b, gap, done) {
+    var left = a.x <= b.x ? a : b;
+    var right = left === a ? b : a;
+    var mid = (a.x + b.x) / 2;
+    var lo = Math.max(a.minX, Math.min(a.maxX, mid - gap / 2));
+    var hi = Math.max(b.minX, Math.min(b.maxX, mid + gap / 2));
+    var todo = 2;
+    function arrived() { if (--todo === 0) done(); }
+    left.walkTo(lo, function () { left.play('idle', { skipEnter: true }); left.setDir(1); arrived(); });
+    right.walkTo(hi, function () { right.play('idle', { skipEnter: true }); right.setDir(-1); arrived(); });
+  }
+
+  var SCENES = {
+    // both raise a limb, a sparkle pops between them
+    highfive: {
+      eligible: function () { return true; },
+      run: function (a, b, fx, done) {
+        meet(a, b, 54, function () {
+          a.play('wave'); b.play('wave');
+          setTimeout(function () { spark(fx, (a.x + b.x) / 2 + 30); }, 650);
+          setTimeout(function () { a.pulse('hop', 470); b.pulse('hop', 470); }, 1400);
+          setTimeout(done, 2400);
+        });
+      }
+    },
+
+    // side by side, greeting the traveler in near-sync
+    syncwave: {
+      eligible: function () { return true; },
+      run: function (a, b, fx, done) {
+        meet(a, b, 88, function () {
+          a.setDir(1); b.setDir(1);
+          a.play('wave');
+          setTimeout(function () { b.play('wave'); }, 180);
+          setTimeout(done, 2400);
+        });
+      }
+    },
+
+    // one playful lap across the strip, both hop at the end
+    chase: {
+      eligible: function (a, b) { return a.maxX - a.minX > 160; },
+      run: function (a, b, fx, done) {
+        var runner = Math.random() < .5 ? a : b;
+        var chaser = runner === a ? b : a;
+        var goal = runner.x - runner.minX < runner.maxX - runner.x ? runner.maxX : runner.minX;
+        runner.walkTo(goal, function () { runner.play('idle', { skipEnter: true }); });
+        setTimeout(function () {
+          chaser.walkTo(goal < chaser.x ? goal + 40 : goal - 40, function () {
+            chaser.play('idle', { skipEnter: true });
+            runner.pulse('hop', 470); chaser.pulse('hop', 470);
+            runner.setDir(chaser.x < runner.x ? -1 : 1);
+            chaser.setDir(runner.x < chaser.x ? -1 : 1);
+            setTimeout(done, 800);
+          });
+        }, 350);
+      }
+    },
+
+    // Passi officiates: Koffi gets a fresh passport-control sticker
+    stampgift: {
+      eligible: function (a, b) { return byId(a, b, 'passi') && byId(a, b, 'koffi'); },
+      run: function (a, b, fx, done) {
+        var passi = byId(a, b, 'passi'), koffi = byId(a, b, 'koffi');
+        meet(a, b, 60, function () {
+          passi.addC('look-up');
+          passi.pulse('hop', 470);
+          koffi.play('stamp');
+          setTimeout(function () { spark(fx, koffi.x + 36, '★'); }, 1100);
+          setTimeout(function () { passi.remC('look-up'); passi.addC('squint'); }, 2100);
+          setTimeout(function () { passi.remC('squint'); done(); }, 3400);
+        });
+      }
+    },
+
+    // Puffi climbs aboard and naps while Koffi glides the trolley across
+    napride: {
+      eligible: function (a, b) { return byId(a, b, 'puffi') && byId(a, b, 'koffi'); },
+      run: function (a, b, fx, done) {
+        var puffi = byId(a, b, 'puffi'), koffi = byId(a, b, 'koffi');
+        if (koffi.maxX - koffi.minX < 150) { done(); return; }
+        meet(a, b, 44, function () {
+          puffi.pulse('hop', 470);
+          setTimeout(function () {
+            var jumper = puffi.el.querySelector('.jumper');
+            if (jumper) jumper.style.bottom = '44px';   // hop onto the lid
+            puffi.play('sleep');
+            koffi.play('roll');                          // enter.roll drives the glide + self-tucks
+          }, 500);
+          var follow = setInterval(function () {         // ride shotgun on the suitcase
+            puffi.x = TrekMascots.clamp(koffi.x + 3, puffi.minX, puffi.maxX);
+          }, 40);
+          setTimeout(function () {
+            clearInterval(follow);
+            var jumper = puffi.el.querySelector('.jumper');
+            if (jumper) jumper.style.bottom = '';
+            puffi.play('stretch');
+            setTimeout(done, 1300);
+          }, 4600);
+        });
+      }
+    },
+
+    // Chiki shares the warm steam; the partner leans in and basks
+    steamshare: {
+      eligible: function (a, b) { return byId(a, b, 'chiki'); },
+      run: function (a, b, fx, done) {
+        var chiki = byId(a, b, 'chiki');
+        var pal = chiki === a ? b : a;
+        meet(a, b, 48, function () {
+          chiki.play(has(chiki, 'steam') ? 'steam' : 'idle');
+          pal.addC(pal.x < chiki.x ? 'look-r' : 'look-l');
+          setTimeout(function () { pal.addC('squint'); }, 900);
+          setTimeout(function () { spark(fx, (a.x + b.x) / 2 + 30, '♥'); }, 1300);
+          setTimeout(function () {
+            pal.remC('look-l'); pal.remC('look-r'); pal.remC('squint');
+            done();
+          }, 3000);
+        });
+      }
+    },
+
+    // Chiki vanishes into the pouch; the partner searches, Chiki pops back out
+    peekaboo: {
+      eligible: function (a, b) { var c = byId(a, b, 'chiki'); return c && has(c, 'duck'); },
+      run: function (a, b, fx, done) {
+        var chiki = byId(a, b, 'chiki');
+        var pal = chiki === a ? b : a;
+        meet(a, b, 58, function () {
+          chiki.play('duck');
+          setTimeout(function () { pal.addC('look-l'); }, 500);
+          setTimeout(function () { pal.remC('look-l'); pal.addC('look-r'); }, 1150);
+          setTimeout(function () { pal.remC('look-r'); }, 1800);
+          setTimeout(function () { pal.pulse('hop', 470); pal.addC('squint'); }, 2350);
+          setTimeout(function () { pal.remC('squint'); done(); }, 3300);
+        });
+      }
+    }
+  };
+
+  function Director(a, b, stage) {
+    this.a = a;
+    this.b = b;
+    this.fx = document.getElementById('stage-fx');
+    this.busy = false;
+    this.stopped = false;
+    this.glanceAt = performance.now() + rand(18000, 36000);
+    this.sceneAt = performance.now() + rand(25000, 60000);
+  }
+
+  Director.prototype = {
+    stop: function () { this.stopped = true; },
+
+    calm: function () {
+      return CALM[this.a.state] && CALM[this.b.state] && !this.a.paused && !this.b.paused;
+    },
+
+    tick: function () {
+      if (this.stopped || this.busy) return;
+      var now = performance.now();
+
+      // ambient awareness: a brief glance across the strip
+      if (now > this.glanceAt) {
+        this.glanceAt = now + rand(20000, 42000);
+        if (this.calm() && Math.abs(this.a.x - this.b.x) > 40) {
+          var g = Math.random() < .5 ? this.a : this.b;
+          var o = g === this.a ? this.b : this.a;
+          g.addC(o.x < g.x ? 'look-l' : 'look-r');
+          setTimeout(function () { g.remC('look-l'); g.remC('look-r'); }, rand(600, 1100));
+        }
+      }
+
+      if (now > this.sceneAt) {
+        if (!this.calm()) { this.sceneAt = now + 8000; return; } // wait out the nap/roll/stamp
+        this.playScene();
+      }
+    },
+
+    playScene: function () {
+      var deck = [], k;
+      for (k in SCENES) if (SCENES[k].eligible(this.a, this.b)) deck.push(k);
+      if (!deck.length) { this.sceneAt = performance.now() + 120000; return; }
+      var name = deck[Math.floor(Math.random() * deck.length)];
+      var self = this;
+      this.busy = true;
+      this.a.hold(); this.b.hold();
+      var guard = setTimeout(finish, 12000); // a stuck scene must never freeze the strip
+      function finish() {
+        clearTimeout(guard);
+        if (!self.busy) return;
+        self.busy = false;
+        self.sceneAt = performance.now() + rand(90000, 240000);
+        self.a.release(); self.b.release();
+      }
+      try {
+        SCENES[name].run(this.a, this.b, this.fx, finish);
+      } catch (e) {
+        finish();
+      }
+    }
+  };
+
+  window.TrekDirector = {
+    start: function (a, b, stage) { return new Director(a, b, stage); }
+  };
+})();
+</script>
+<!-- build:inline-scripts:end -->
 <script>
 (function () {
   'use strict';

@@ -21,7 +21,7 @@
   TrekMascots.register({
     id: 'chiki',
     name: 'Chiki',
-    tagline: 'the karaage — best before: right now',
+    tagline: 'the fried chicken, best right now',
     width: 66,
     height: 73,
     css: CSS,

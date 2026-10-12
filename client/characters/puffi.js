@@ -327,7 +327,7 @@
   TrekMascots.register({
     id: 'puffi',
     name: 'Puffi',
-    tagline: 'the neck pillow — five more minutes',
+    tagline: 'the neck pillow, five more minutes',
     width: 70,
     height: 64,
     css: CSS,

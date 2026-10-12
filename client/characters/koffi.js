@@ -19,7 +19,7 @@
   TrekMascots.register({
     id: 'koffi',
     name: 'Koffi',
-    tagline: 'the suitcase — packed since Tuesday',
+    tagline: 'the suitcase, packed since Tuesday',
     width: 72,
     height: 79,
     css: CSS,

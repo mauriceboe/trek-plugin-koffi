@@ -520,7 +520,7 @@
   TrekMascots.register({
     id: 'passi',
     name: 'Passi',
-    tagline: 'the passport — valid for wherever',
+    tagline: 'the passport, valid for wherever',
     width: 62,
     height: 74,
     css: CSS,

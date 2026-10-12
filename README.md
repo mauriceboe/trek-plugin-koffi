@@ -4,16 +4,16 @@
 
 ![Koffi, Chiki, Passi and Puffi on the boarding pass of the dashboard](./docs/screenshot.png)
 
-## Where you see it
+## What it does
 
-On the **Dashboard**. Once the plugin is active, the troupe walks along the
-boarding pass at the bottom of the big "Up next" trip card. There is nothing to
+It is a **dashboard widget**. Once the plugin is active, the troupe walks
+along the boarding pass at the bottom of the big "Up next" trip card. There is nothing to
 open and no extra page: if you have an upcoming trip, they are there.
 
 Pick who walks there in **Settings → Plugins → Koffi & Friends**: one of them,
 or two for a duo.
 
-## The troupe
+### The troupe
 
 | | |
 |---|---|
@@ -28,6 +28,10 @@ on Koffi for a nap.
 
 They also react to your actual trip. The closer the departure, the more
 excited they get; while the trip is running they put on sunglasses.
+
+## Screenshots
+
+![The troupe on the dashboard's boarding pass](./docs/screenshot.png)
 
 ## Permissions
 

@@ -39,9 +39,11 @@ const END = '<!-- build:inline-scripts:end -->';
 const CHARACTERS = ['koffi', 'chiki', 'passi', 'puffi'].map((n) => `characters/${n}.js`);
 
 const FRAMES = [
-  { html: 'client/index.html', scripts: ['engine.js', ...CHARACTERS, 'director.js'] },
+  // three.js (r149, the last release with a UMD build) comes first; the 3D figures need it and
+  // fall back to the SVG characters when WebGL is missing.
+  { html: 'client/index.html', scripts: ['vendor/three.min.js', 'engine.js', ...CHARACTERS, 'mascots3d.js', 'director.js'] },
   // The picker renders previews but never animates a scene, so it needs no director.
-  { html: 'client/settings.html', scripts: ['engine.js', ...CHARACTERS] },
+  { html: 'client/settings.html', scripts: ['vendor/three.min.js', 'engine.js', ...CHARACTERS, 'mascots3d.js'] },
 ];
 
 /**

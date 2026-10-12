@@ -110,6 +110,7 @@
           setTimeout(function () {
             var jumper = puffi.el.querySelector('.jumper');
             if (jumper) jumper.style.bottom = '44px';   // hop onto the lid
+            puffi.perchOn = koffi;                         // the 3D stage seats him on top
             puffi.play('sleep');
             koffi.play('roll');                          // enter.roll drives the glide + self-tucks
           }, 500);
@@ -120,6 +121,7 @@
             clearInterval(follow);
             var jumper = puffi.el.querySelector('.jumper');
             if (jumper) jumper.style.bottom = '';
+            puffi.perchOn = null;
             puffi.play('stretch');
             setTimeout(done, 1300);
           }, 4600);

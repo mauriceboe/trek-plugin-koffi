@@ -50,12 +50,17 @@
     this.el.setAttribute('data-ch', def.id);
     this.el.style.width = def.width + 'px';
     this.el.style.height = def.height + 'px';
-    this.el.innerHTML =
+    // headless: the 3D stage draws the character; the element only carries the class contract
+    if (this.opts.headless) this.el.style.visibility = 'hidden';
+    else this.el.innerHTML =
       (def.shadow || '') +
       '<div class="jumper"><div class="flip">' + def.svg + '</div></div>' +
       (def.fx || '');
     stage.appendChild(this.el);
     this.flip = this.el.querySelector('.flip');
+    this.stateAt = performance.now();
+    this.classAt = {};
+    this.perchOn = null;          // duet: the runtime this one rides on (3D stage only)
 
     this.mood = def.moods[0];
     this.x = 0; this.dir = 1; this.vx = 0;
@@ -72,7 +77,7 @@
   }
 
   Runtime.prototype = {
-    addC: function (c) { this.el.classList.add(c); },
+    addC: function (c) { if (!this.el.classList.contains(c)) this.classAt[c] = performance.now(); this.el.classList.add(c); },
     remC: function (c) { this.el.classList.remove(c); },
     hasC: function (c) { return this.el.classList.contains(c); },
     later: function (fn, ms) { var t = setTimeout(fn, ms); this.timers.push(t); return t; },
@@ -91,14 +96,14 @@
     setDir: function (d) {
       if (this.booted && d !== this.dir && !reduced && this.def.onTurn) this.def.onTurn(this);
       this.dir = d;
-      this.flip.style.transform = 'scaleX(' + (d < 0 ? -1 : 1) + ')';
+      if (this.flip) this.flip.style.transform = 'scaleX(' + (d < 0 ? -1 : 1) + ')';
       this.el.classList.toggle('flipped', d < 0); // counter-flips text glyphs
     },
 
     /** re-trigger a one-shot class (reflow-cycled) */
     pulse: function (c, ms) {
       var self = this;
-      this.remC(c); void this.el.offsetWidth; this.addC(c);
+      this.remC(c); void this.el.offsetWidth; this.addC(c); this.classAt[c] = performance.now();
       if (ms) setTimeout(function () { self.remC(c); }, ms);
     },
 
@@ -146,6 +151,7 @@
           this.afterWalk = name;
           this.setDir(edge < this.x ? -1 : 1);
           this.state = 'walk';
+          this.stateAt = performance.now();
           this.addC('st-walk');
           var self0 = this;
           this.later(function () { self0.end(); },
@@ -155,6 +161,7 @@
       }
 
       this.state = name;
+      this.stateAt = performance.now();
       this.walkTarget = null;
       this.addC('st-' + name);
       if (this.def.enter[name]) this.def.enter[name](this);
@@ -189,6 +196,7 @@
       var sc = this.def.stateClasses;
       for (var i = 0; i < sc.length; i++) this.remC(sc[i]);
       this.state = name;
+      this.stateAt = performance.now();
       this.walkTarget = null;
       this.addC('st-' + name);
       if (!(opts && opts.skipEnter) && this.def.enter[name]) this.def.enter[name](this);
